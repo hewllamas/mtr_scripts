@@ -5,4 +5,6 @@ mtr_setup_portable/assets/Software/*/
 # Secrets and run output
 mtr_setup_portable/vnc-password.txt
 mtr_setup_portable/logs/
+mtr_setup_network/network-settings.psd1
+mtr_setup_network/logs/
 *.log
