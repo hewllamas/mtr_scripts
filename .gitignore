@@ -1,0 +1,8 @@
+# Vendor installers: not redistributable, and some are over GitHub's 100 MB file limit.
+# They live in mtr_setup_portable/assets/Software/<vendor>/ - see the README in that folder.
+mtr_setup_portable/assets/Software/*/
+
+# Secrets and run output
+mtr_setup_portable/vnc-password.txt
+mtr_setup_portable/logs/
+*.log
