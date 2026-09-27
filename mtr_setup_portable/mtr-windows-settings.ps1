@@ -48,7 +48,7 @@ param(
 )
 
 # Bump on every change to this file, format YYYY.MM.DD-NNN.
-$ScriptVersion = '2026.09.27-001'
+$ScriptVersion = '2026.09.27-002'
 
 $ErrorActionPreference = 'Continue'
 
@@ -1511,7 +1511,7 @@ catch {
 # ---------------------------------------------------------------------------
 # 10. REPORT
 # ---------------------------------------------------------------------------
-Write-Host "`n[12] Writing report" -ForegroundColor Cyan
+Write-Host "`n[10] Writing report" -ForegroundColor Cyan
 
 $restartReasons = @(Get-PendingRestartReasons)
 
@@ -1641,7 +1641,7 @@ catch {
 # ---------------------------------------------------------------------------
 # 11. APPLY
 # ---------------------------------------------------------------------------
-Write-Host "`n[13] Restarting Explorer to apply..." -ForegroundColor Cyan
+Write-Host "`n[11] Restarting Explorer to apply..." -ForegroundColor Cyan
 Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
