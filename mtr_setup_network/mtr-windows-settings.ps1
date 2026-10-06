@@ -35,7 +35,7 @@ param(
 )
 
 # Bump on every change to this file, format YYYY.MM.DD-NNN.
-$ScriptVersion = '2026.09.27-001'
+$ScriptVersion = '2026.09.27-002'
 
 $ErrorActionPreference = 'Continue'
 Write-Host "mtr-windows-settings.ps1 v$ScriptVersion`n" -ForegroundColor Cyan
@@ -163,7 +163,56 @@ function Invoke-AutomationElement {
     }
 }
 
+# Names (and AutomationIds) of what the Settings window currently exposes, for
+# failure messages - element names differ between Windows builds.
+function Get-SettingsSeen {
+    param($Root, [int]$Max = 120)
+    $names = @($Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+               ForEach-Object {
+                   $t = $_.Current.ControlType.ProgrammaticName -replace 'ControlType\.', ''
+                   $n = $_.Current.Name
+                   $id = $_.Current.AutomationId
+                   if ($n -or $id) { if ($id) { "$t '$n' [$id]" } else { "$t '$n'" } }
+               } |
+               Select-Object -Unique -First $Max)
+    return ($names -join '; ')
+}
+
+# The "Folders" row on Personalization > Start: a group (AutomationId below) holding
+# the clickable button. The button's own name varies between builds (plain
+# "Folders", "Folders <description>", or none), so match the group by id or name
+# and return whichever of the row / its button can be invoked.
+function Find-StartFoldersRow {
+    param($Root)
+    $descendants = [System.Windows.Automation.TreeScope]::Descendants
+    $isInvokable = [System.Windows.Automation.AutomationElement]::IsInvokePatternAvailableProperty
+    $rows = @($Root.FindAll($descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+              Where-Object { $_.Current.AutomationId -eq 'SystemSettings_Start_LinkToPlacesPage_ButtonEntityItem' -or
+                             $_.Current.Name -eq 'Folders' -or $_.Current.Name -like 'Folders *' })
+    foreach ($row in $rows) {
+        if ($row.GetCurrentPropertyValue($isInvokable)) { return $row }
+        $inner = $row.FindFirst($descendants, (New-Object System.Windows.Automation.PropertyCondition($isInvokable, $true)))
+        if ($inner) { return $inner }
+    }
+    return $null
+}
+
+# Scroll every vertically scrollable region to its end. Rows below the fold may
+# not exist in the automation tree until they have been scrolled towards.
+function Move-SettingsPageToEnd {
+    param($Root)
+    $scrollable = [System.Windows.Automation.AutomationElement]::IsScrollPatternAvailableProperty
+    $regions = $Root.FindAll([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.PropertyCondition($scrollable, $true)))
+    foreach ($region in $regions) {
+        try {
+            $sp = $region.GetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern)
+            if ($sp.Current.VerticallyScrollable) { $sp.SetScrollPercent([System.Windows.Automation.ScrollPattern]::NoScroll, 100) }
+        } catch { }
+    }
+}
+
 $startFoldersRoot = $null
+$foldersPageOpened = $false
 try {
     # ms-settings: URI activation (Start-Process 'ms-settings:...') is
     # intercepted by the Teams Rooms shell on this hardware - confirmed
@@ -183,6 +232,13 @@ try {
     }
     if (-not $startFoldersRoot) { throw "Settings window did not appear" }
 
+    # On some builds (seen on Windows 11 23H2) Settings opens in a window narrow
+    # enough that the left nav collapses into an "Open Navigation" button and
+    # Personalization is not in the tree at all. Maximise it first so the nav is
+    # expanded; if it is still collapsed, open it below.
+    try { $startFoldersRoot.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).SetWindowVisualState([System.Windows.Automation.WindowVisualState]::Maximized) } catch { }
+    Start-Sleep -Milliseconds 800
+
     # Click through Personalization -> Start by hand, since the ms-settings:
     # deep link that would have jumped straight there is exactly what's
     # being intercepted.
@@ -195,7 +251,25 @@ try {
         Start-Sleep -Milliseconds 500
         $personalizationItem = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $personalizationCond)
     }
-    if (-not $personalizationItem) { throw "Could not find Personalization in the Settings nav" }
+    if (-not $personalizationItem) {
+        $navCond = New-Object System.Windows.Automation.AndCondition(
+            (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)),
+            (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Open Navigation'))
+        )
+        # The button reads "Open Navigation" only while the pane is closed, so if
+        # the pane shut again (or the click didn't take) it is found and clicked again.
+        for ($attempt = 0; $attempt -lt 3 -and -not $personalizationItem; $attempt++) {
+            $navButton = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $navCond)
+            if ($navButton) { Invoke-AutomationElement $navButton }
+            for ($i = 0; $i -lt 6 -and -not $personalizationItem; $i++) {
+                Start-Sleep -Milliseconds 500
+                $personalizationItem = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $personalizationCond)
+            }
+        }
+    }
+    if (-not $personalizationItem) {
+        throw "Could not find Personalization in the Settings nav. Settings showed: $(Get-SettingsSeen $startFoldersRoot)"
+    }
     Invoke-AutomationElement $personalizationItem
 
     $startItemCond = New-Object System.Windows.Automation.AndCondition(
@@ -207,21 +281,19 @@ try {
         Start-Sleep -Milliseconds 500
         $startItem = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $startItemCond)
     }
-    if (-not $startItem) { throw "Could not find Start in the Personalization list" }
+    if (-not $startItem) { throw "Could not find Start in the Personalization list. Settings showed: $(Get-SettingsSeen $startFoldersRoot)" }
     Invoke-AutomationElement $startItem
     Start-Sleep -Milliseconds 500
 
-    $foldersRowCond = New-Object System.Windows.Automation.AndCondition(
-        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)),
-        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Folders'))
-    )
     $foldersRow = $null
     for ($i = 0; $i -lt 20 -and -not $foldersRow; $i++) {
         Start-Sleep -Milliseconds 500
-        $foldersRow = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $foldersRowCond)
+        $foldersRow = Find-StartFoldersRow $startFoldersRoot
+        if (-not $foldersRow -and $i -eq 4) { Move-SettingsPageToEnd $startFoldersRoot }
     }
-    if (-not $foldersRow) { throw "Could not find the Folders row on the Start page" }
+    if (-not $foldersRow) { throw "Could not find the Folders row on the Start page. Settings showed: $(Get-SettingsSeen $startFoldersRoot)" }
     $foldersRow.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $foldersPageOpened = $true
     Start-Sleep -Seconds 1
 }
 catch {
@@ -229,6 +301,7 @@ catch {
     Add-Result 'Start Folders page' 'navigate' 'FAILED' $_.Exception.Message
 }
 
+$seenReported = $false
 foreach ($name in $StartFolderIds.Keys) {
     if (-not $startFoldersRoot) {
         Add-Result "Start folder: $name" 'on' 'FAILED' 'Settings navigation failed'
@@ -237,7 +310,14 @@ foreach ($name in $StartFolderIds.Keys) {
     try {
         $cond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::AutomationIdProperty, $StartFolderIds[$name])
         $toggle = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
-        if (-not $toggle) { throw "toggle not found (AutomationId=$($StartFolderIds[$name]))" }
+        if (-not $toggle) {
+            $why = "toggle not found (AutomationId=$($StartFolderIds[$name]))"
+            if ($foldersPageOpened -and -not $seenReported) {
+                $why += ". Settings showed: $(Get-SettingsSeen $startFoldersRoot)"
+                $seenReported = $true
+            }
+            throw $why
+        }
 
         $pattern = $toggle.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
         if ($pattern.Current.ToggleState -eq [System.Windows.Automation.ToggleState]::On) {
