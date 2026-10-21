@@ -38,6 +38,7 @@ param(
         if ($found) { $found.FullName } else { Join-Path $InstallersRoot 'Splashtop\Splashtop_Streamer_Windows_DEPLOY_INSTALLER_VERSION_CODE.exe' }
     ),
     [string]$MmcFile           = (Join-Path $AssetsRoot 'MTR-MMC-Local.msc'),
+    [string]$StartPinsFile     = (Join-Path $AssetsRoot 'start2.bin'),   # a start2.bin with nothing pinned, captured from a cleared MTR
     [string]$LogFolder         = (Join-Path $PSScriptRoot 'logs'),
     [int]$DisplayTimeoutMinutes = 20,   # display off after (0 = never); also picked in the setup prompt, this is its default
     [string[]]$Install,          # skip the software prompt and install only these, e.g. -Install Extron,TightVNC (matches the start of the name)
@@ -48,7 +49,7 @@ param(
 )
 
 # Bump on every change to this file, format YYYY.MM.DD-NNN.
-$ScriptVersion = '2026.09.27-002'
+$ScriptVersion = '2026.10.21-001'
 
 $ErrorActionPreference = 'Continue'
 
@@ -418,6 +419,45 @@ Set-Reg $Advanced 'Start_TrackDocs'            0   # recommended + recent files 
 Set-Reg $Advanced 'Start_IrisRecommendations'  0   # tips, shortcuts, new apps
 Set-Reg $Advanced 'Start_TrackProgs'           0   # most used apps
 Set-Reg $Advanced 'Start_AccountNotifications' 0
+# "Show recently added apps" - newly installed apps (7-Zip, Firefox...) otherwise
+# land in the Recommended section right after the installs. Not an Advanced value.
+Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowRecentList' 0
+Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowFrequentList' 0
+
+# Hide the Recommended section itself. Policy key - expected to be refused on
+# builds where HKLM Policies is locked to SYSTEM (as for AllowNewsAndInterests).
+$hideRec = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'
+try {
+    if (-not (Test-Path $hideRec)) { New-Item -Path $hideRec -Force -ErrorAction Stop | Out-Null }
+    Set-ItemProperty -Path $hideRec -Name 'HideRecommendedSection' -Value 1 -Type DWord -ErrorAction Stop
+    Write-Host ("  {0,-42} = 1" -f 'HideRecommendedSection (policy)')
+    Add-Result 'HideRecommendedSection (policy)' 1 'OK' $hideRec
+}
+catch {
+    Write-Host ("  {0,-42} = skipped (Policies locked)" -f 'HideRecommendedSection (policy)') -ForegroundColor DarkGray
+    Add-Result 'HideRecommendedSection (policy)' 1 'SKIP' "$hideRec - $($_.Exception.Message)"
+}
+
+# Empty the Pinned grid (Edge, Outlook, Store, Photos, WhatsApp, LinkedIn ...) by
+# swapping in a start2.bin with nothing pinned. The "Configure Start Pins" policy
+# with an empty list was written and ignored on Windows 11 25H2, so it is not used.
+if (Test-Path -LiteralPath $StartPinsFile) {
+    try {
+        $startState = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState'
+        Stop-Process -Name StartMenuExperienceHost -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 800
+        Copy-Item -LiteralPath $StartPinsFile -Destination (Join-Path $startState 'start2.bin') -Force -ErrorAction Stop
+        Write-Host ("  {0,-42} = cleared" -f 'Start pinned apps')
+        Add-Result 'Start pinned apps' 'cleared' 'OK' "start2.bin -> $startState"
+    }
+    catch {
+        Write-Host ("  {0,-42} = FAILED: {1}" -f 'Start pinned apps', $_.Exception.Message) -ForegroundColor Red
+        Add-Result 'Start pinned apps' 'clear' 'FAILED' $_.Exception.Message
+    }
+} else {
+    Write-Host ("  {0,-42} = no start2.bin" -f 'Start pinned apps') -ForegroundColor DarkGray
+    Add-Result 'Start pinned apps' 'no start2.bin' 'SKIP' "not found: $StartPinsFile"
+}
 
 # Folders shown next to the Power button. This build does not read the
 # classic per-user values (Start_Show*, tested above) or the HKLM GPO
@@ -560,16 +600,19 @@ try {
     if (-not $personalizationItem) {
         throw "Could not find Personalization in the Settings nav. Settings showed: $(Get-SettingsSeen $startFoldersRoot)"
     }
-    Invoke-AutomationElement $personalizationItem
-
     $startItemCond = New-Object System.Windows.Automation.AndCondition(
         (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)),
         (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Start'))
     )
+    # On a slow-loading page (seen on 24H2 with the Ethernet page open) the first
+    # click can be swallowed, so click again if Start has not appeared.
     $startItem = $null
-    for ($i = 0; $i -lt 20 -and -not $startItem; $i++) {
-        Start-Sleep -Milliseconds 500
-        $startItem = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $startItemCond)
+    for ($attempt = 0; $attempt -lt 3 -and -not $startItem; $attempt++) {
+        Invoke-AutomationElement $personalizationItem
+        for ($i = 0; $i -lt 10 -and -not $startItem; $i++) {
+            Start-Sleep -Milliseconds 500
+            $startItem = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $startItemCond)
+        }
     }
     if (-not $startItem) { throw "Could not find Start in the Personalization list. Settings showed: $(Get-SettingsSeen $startFoldersRoot)" }
     Invoke-AutomationElement $startItem
@@ -1225,34 +1268,86 @@ if (Test-Path $stuck) {
 }
 
 # --- Pins ---
-# File Explorer and Firefox, added after the default pins. Set with a taskbar
-# layout file plus the per-user "Start Layout" policy (User Configuration >
-# Administrative Templates > Start Menu and Taskbar), so it applies to the
-# account running this (Admin) at its next sign-in, and again at any sign-in
-# after the file changes. A pin whose shortcut is missing at sign-in is not shown.
-$pinEntries = @('<taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer"/>')
-Write-Host ("  {0,-42} = on next sign-in" -f 'Taskbar pin: File Explorer')
-Add-Result 'Taskbar pin: File Explorer' 'on next sign-in' 'OK' 'Microsoft.Windows.Explorer'
+# Only these, in this order, with every default pin cleared: File Explorer, the
+# MTR management console, Settings, Firefox, Yealink Room Connect (Yealink
+# hardware only) and Logitech Sync - the last three only if installed. Set with a
+# taskbar layout file plus the per-user "Start Layout" policy (User Configuration
+# > Administrative Templates > Start Menu and Taskbar), so it applies to the
+# account running this (Admin). The Apply step restarts Explorer, which applies it,
+# and it applies again at any sign-in after the file changes. A pin whose shortcut
+# is missing when it is applied is not shown.
+$pinEntries = @()
 
-$pinShell    = New-Object -ComObject WScript.Shell
-$firefoxLink = $null
-foreach ($programs in @((Join-Path $env:ALLUSERSPROFILE 'Microsoft\Windows\Start Menu\Programs'), (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
-    $firefoxLink = Get-ChildItem -Path $programs -Filter '*.lnk' -ErrorAction SilentlyContinue | Where-Object {
-        $sc = $pinShell.CreateShortcut($_.FullName)
-        $sc.TargetPath -like '*\firefox.exe' -and -not $sc.Arguments
-    } | Select-Object -First 1
-    if ($firefoxLink) { break }
+function Add-PinApp {
+    param($Name, $Entry, $Detail)
+    $script:pinEntries += $Entry
+    Write-Host ("  {0,-42} = after Explorer restart" -f "Taskbar pin: $Name")
+    Add-Result "Taskbar pin: $Name" 'after Explorer restart' 'OK' $Detail
 }
-if ($firefoxLink) {
-    $firefoxPath = $firefoxLink.FullName.Replace($env:ALLUSERSPROFILE, '%ALLUSERSPROFILE%').Replace($env:APPDATA, '%APPDATA%')
-    $pinEntries += '<taskbar:DesktopApp DesktopApplicationLinkPath="' + [Security.SecurityElement]::Escape($firefoxPath) + '"/>'
-    Write-Host ("  {0,-42} = on next sign-in" -f 'Taskbar pin: Firefox')
-    Add-Result 'Taskbar pin: Firefox' 'on next sign-in' 'OK' $firefoxLink.FullName
+
+function Add-PinShortcut {
+    param($Name, $LnkPath)
+    $p = $LnkPath.Replace($env:ALLUSERSPROFILE, '%ALLUSERSPROFILE%').Replace($env:APPDATA, '%APPDATA%').Replace($env:USERPROFILE, '%USERPROFILE%')
+    Add-PinApp $Name ('<taskbar:DesktopApp DesktopApplicationLinkPath="' + [Security.SecurityElement]::Escape($p) + '"/>') $LnkPath
+}
+
+# First top-level Start menu shortcut (all-users, then Admin) the filter accepts.
+$pinShell = New-Object -ComObject WScript.Shell
+function Find-StartMenuLink {
+    param([scriptblock]$Filter)
+    foreach ($programs in @((Join-Path $env:ALLUSERSPROFILE 'Microsoft\Windows\Start Menu\Programs'), (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
+        $hit = Get-ChildItem -Path $programs -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue | Where-Object {
+            $sc = $pinShell.CreateShortcut($_.FullName)
+            & $Filter $_ $sc
+        } | Select-Object -First 1
+        if ($hit) { return $hit }
+    }
+    return $null
+}
+
+Add-PinApp 'File Explorer' '<taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer"/>' 'Microsoft.Windows.Explorer'
+
+if ($mmcLnkPath -and (Test-Path $mmcLnkPath)) {
+    Add-PinShortcut 'MTR console' $mmcLnkPath
 } else {
+    Write-Host ("  {0,-42} = no shortcut" -f 'Taskbar pin: MTR console')
+    Add-Result 'Taskbar pin: MTR console' 'no shortcut' 'SKIP' 'MMC Desktop shortcut was not created'
+}
+
+Add-PinApp 'Settings' '<taskbar:UWA AppUserModelID="windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"/>' 'windows.immersivecontrolpanel'
+
+$firefoxLink = Find-StartMenuLink { param($file, $sc) $sc.TargetPath -like '*\firefox.exe' -and -not $sc.Arguments }
+if ($firefoxLink) { Add-PinShortcut 'Firefox' $firefoxLink.FullName }
+else {
     Write-Host ("  {0,-42} = not installed" -f 'Taskbar pin: Firefox')
     Add-Result 'Taskbar pin: Firefox' 'not installed' 'SKIP' 'no Firefox Start menu shortcut found'
 }
 
+if ($maker -like '*Yealink*') {
+    $rcExe  = Join-Path $env:ProgramFiles 'Yealink Room Connect\bin\Yealink Room Connect.exe'
+    $rcLink = Find-StartMenuLink { param($file, $sc) $sc.TargetPath -eq $rcExe }
+    if (-not $rcLink -and (Test-Path -LiteralPath $rcExe)) {
+        # Installed but no Start menu shortcut: make one so there is a .lnk to pin.
+        $rcPath = Join-Path $env:ALLUSERSPROFILE 'Microsoft\Windows\Start Menu\Programs\Yealink Room Connect.lnk'
+        $rcSc = $pinShell.CreateShortcut($rcPath)
+        $rcSc.TargetPath = $rcExe
+        $rcSc.WorkingDirectory = Split-Path $rcExe
+        $rcSc.Save()
+        $rcLink = Get-Item -LiteralPath $rcPath
+    }
+    if ($rcLink) { Add-PinShortcut 'Yealink Room Connect' $rcLink.FullName }
+    else {
+        Write-Host ("  {0,-42} = not installed" -f 'Taskbar pin: Yealink Room Connect')
+        Add-Result 'Taskbar pin: Yealink Room Connect' 'not installed' 'SKIP' "not found: $rcExe"
+    }
+}
+
+$syncLink = Find-StartMenuLink { param($file, $sc) $file.BaseName -like '*Logi*Sync*' }
+if ($syncLink) { Add-PinShortcut 'Logitech Sync' $syncLink.FullName }
+else {
+    Write-Host ("  {0,-42} = not installed" -f 'Taskbar pin: Logitech Sync')
+    Add-Result 'Taskbar pin: Logitech Sync' 'not installed' 'SKIP' 'no Start menu shortcut named *Logi*Sync*'
+}
 $layoutXml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <LayoutModificationTemplate
@@ -1261,7 +1356,7 @@ $layoutXml = @"
     xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout"
     xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout"
     Version="1">
-  <CustomTaskbarLayoutCollection>
+  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
     <defaultlayout:TaskbarLayout>
       <taskbar:TaskbarPinList>
         $($pinEntries -join "`r`n        ")
@@ -1272,7 +1367,7 @@ $layoutXml = @"
 "@
 
 # Left untouched when the content is unchanged, so a re-run does not make the
-# file look newer and re-apply the pins at the next sign-in.
+# file look newer and re-apply the pins at the next Explorer start.
 $layoutFile = Join-Path $env:ProgramData 'MTR-Setup\TaskbarLayout.xml'
 try {
     $layoutDir = Split-Path $layoutFile
@@ -1453,10 +1548,58 @@ else {
 # ---------------------------------------------------------------------------
 # 9. CLEANUP
 # ---------------------------------------------------------------------------
-# Unwanted software found on the fleet gets removed here. One entry so far;
+# Unwanted software found on the fleet gets removed here. TeamViewer and some Store apps so far;
 # add more the same way as they turn up.
 Write-Section 9 "Cleanup"
 
+# Store apps - Xbox (and its helper packages), WhatsApp, Solitaire and LinkedIn.
+# Deprovisioned first, then removed for all users, so a new profile does not get them back.
+# A package Windows marks non-removable is recorded SKIP rather than FAILED.
+$storeApps = [ordered]@{
+    'Xbox'      = @('Microsoft.GamingApp', 'Microsoft.Xbox*')
+    'WhatsApp'  = @('*WhatsApp*')
+    'Solitaire' = @('Microsoft.MicrosoftSolitaireCollection')
+    'LinkedIn'  = @('*LinkedIn*')
+}
+$provisioned = @()
+try { $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop) } catch { }
+foreach ($app in $storeApps.Keys) {
+    $found = 0
+    foreach ($pattern in $storeApps[$app]) {
+        foreach ($p in @($provisioned | Where-Object { $_.DisplayName -like $pattern })) {
+            try {
+                Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction Stop | Out-Null
+                Add-Result "$app (provisioned)" $p.DisplayName 'OK' 'deprovisioned'
+            }
+            catch {
+                Add-Result "$app (provisioned)" $p.DisplayName 'FAILED' $_.Exception.Message
+            }
+        }
+        $pkgs = @()
+        try { $pkgs = @(Get-AppxPackage -AllUsers -Name $pattern -ErrorAction Stop) } catch { }
+        foreach ($pkg in $pkgs) {
+            $found++
+            if ($pkg.NonRemovable) {
+                Write-Host ("  {0,-42} = skipped (non-removable)" -f "$app ($($pkg.Name))") -ForegroundColor DarkGray
+                Add-Result "$app app" $pkg.Name 'SKIP' 'package is marked non-removable'
+                continue
+            }
+            try {
+                Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                Write-Host ("  {0,-42} = removed" -f "$app ($($pkg.Name))") -ForegroundColor Green
+                Add-Result "$app app" $pkg.Name 'OK' "removed $($pkg.PackageFullName)"
+            }
+            catch {
+                Write-Host ("  {0,-42} = FAILED: {1}" -f "$app ($($pkg.Name))", $_.Exception.Message) -ForegroundColor Red
+                Add-Result "$app app" $pkg.Name 'FAILED' "$($pkg.PackageFullName) - $($_.Exception.Message)"
+            }
+        }
+    }
+    if (-not $found) {
+        Write-Host ("  {0,-42} = not installed" -f "$app app")
+        Add-Result "$app app" 'not installed' 'OK' 'nothing to remove'
+    }
+}
 # TeamViewer - unmanaged remote-access tool, redundant now that WinRM and
 # VNC are the sanctioned remote paths. Some builds register more than one
 # Uninstall entry (e.g. a 32-bit view alongside the native one).
@@ -1611,8 +1754,7 @@ if ($restartReasons.Count) {
     Add-Line
 }
 if ($script:TaskbarPinsSet) {
-    Add-Line '  Taskbar pins (File Explorer, Firefox) appear at the next sign-in of this'
-    Add-Line '  account - the launcher logs off or restarts after its countdown.'
+    Add-Line '  Taskbar pins appear when Explorer restarts at the end of this run.'
     Add-Line
 }
 Add-Line '  WinRM is enabled on this machine, but it is a workgroup machine'
@@ -1644,6 +1786,17 @@ catch {
 Write-Host "`n[11] Restarting Explorer to apply..." -ForegroundColor Cyan
 Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
+
+# Explorer keeps the pins it already has in Taskband and then ignores the layout
+# file, so a re-run (or an image that signed in once) keeps its old pins. With
+# Explorer stopped, drop the saved pins so the layout file is applied afresh.
+if ($script:TaskbarPinsSet) {
+    $taskband = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband'
+    foreach ($v in 'Favorites', 'FavoritesResolve', 'FavoritesChanges', 'FavoritesVersion', 'FavoritesRemovedChanges', 'LayoutXMLLastModified') {
+        Remove-ItemProperty -Path $taskband -Name $v -ErrorAction SilentlyContinue
+    }
+    Write-Host "  Taskbar saved pins cleared (layout file applies on the Explorer start below)"
+}
 if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
 
 Write-Host "`nDone. Applied to $ReportHost\$env:USERNAME" -ForegroundColor Green

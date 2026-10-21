@@ -65,18 +65,20 @@ Running the `.ps1` directly from an elevated prompt also accepts:
 | Section | Settings |
 |---|---|
 | Hostname | Renames a `DESKTOP-xxxxxxx` name (NetBIOS rules checked) |
-| Start menu | Turns off recent files, recommendations, most-used apps, tips and account notifications; shows Settings and Downloads beside the power button |
+| Start menu | Turns off recent files, recommendations, most-used apps, recently added apps, tips and account notifications; hides the Recommended section; empties the Pinned grid (swaps in `assets/start2.bin`); shows Settings and Downloads beside the power button |
 | File Explorer | Shows file extensions |
 | Power | Never sleeps or hibernates; display off after N minutes; USB selective suspend, hybrid sleep and PCIe link-state power management off; USB power saving off per device; Modern Standby disabled; wake enabled for the HID presence sensor and touch screen when present |
 | Shortcuts and folders | Creates `Downloads\_mtrsetup`, copies `MTR-MMC-Local.msc` there and adds a Desktop shortcut |
 | Software installs | See below |
-| Taskbar | Hides search and Task view, removes Widgets, shows all tray icons, left-aligned, no badges or flashing, one taskbar, always combine, auto-hide off, pins File Explorer and Firefox |
+| Taskbar | Hides search and Task view, removes Widgets, shows all tray icons, left-aligned, no badges or flashing, one taskbar, always combine, auto-hide off; clears every default pin and pins File Explorer, the MTR console, Settings, Firefox, Yealink Room Connect (Yealink only) and Logitech Sync (the last three only if installed) |
 | Appearance | Wallpaper (Fill), dark mode, automatic accent colour |
 | Remote management | Sets Public network interfaces to Private, enables PS Remoting and WinRM, allows ping; turns TightVNC "hide desktop wallpaper" and "serve Java viewer" off |
-| Cleanup | Removes TeamViewer if present |
+| Cleanup | Removes the Xbox, WhatsApp, Solitaire and LinkedIn Store apps (deprovisioned first, so new profiles do not get them) and TeamViewer if present |
 
 Taskbar pins are set with a layout file (`C:\ProgramData\MTR-Setup\TaskbarLayout.xml`) and
-the per-user Start Layout policy, so they appear at the Admin account's next sign-in.
+the per-user Start Layout policy, and appear when Explorer restarts at the end of the run. Before that restart the saved pins under Taskband are cleared, because Explorer otherwise ignores the layout file once it has pins of its own.
+
+The Pinned grid is emptied by copying ssets/start2.bin (a start2.bin captured from an MTR with everything unpinned) into the Start menu's LocalState folder. Without that file the step is skipped.
 
 ### Software
 
