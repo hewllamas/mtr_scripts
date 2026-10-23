@@ -5,6 +5,7 @@
     ShareHost = 'fileserver'    # file server holding the installers and receiving reports
     ShareUser = 'setupuser'     # local account on that server (used as fileserver\setupuser)
     SharePass = 'change-me'     # its password
+    VncPassword = ''            # TightVNC password for a fresh install (8 characters count); without it a fresh TightVNC install is reported FAILED
 
     # ToolShare     = 'MTR\mtr_setup_network'   # path under \\ShareHost holding run-mtr_setup.bat, assets\ and logs\
     # SoftwareShare = 'Software'                # share holding the installers

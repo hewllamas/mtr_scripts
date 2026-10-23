@@ -64,6 +64,14 @@ if defined NOPROMPTARG set "PSFLAGS=%PSFLAGS% -NoPrompt"
 if defined DEBUGARG echo [DEBUG MODE ENABLED]
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%HERE%%PS1%"%PSFLAGS%
 set "PSEXIT=%errorlevel%"
+
+:: Cancel in the setup prompt exits 2 before anything is changed - no log-off, no restart.
+if "%PSEXIT%"=="2" (
+    echo.
+    echo Cancelled - nothing was changed.
+    pause
+    exit /b
+)
 echo.
 echo ---------------------------------------------------------------------
 echo Finished on %COMPUTERNAME% as %USERNAME%.

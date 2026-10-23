@@ -1,44 +1,61 @@
 <#
-    mtr-windows-settings.ps1
+    mtr-windows-settings.ps1  (NETWORK edition)
 
-    Standardises Windows shell, power and desktop settings on Microsoft Teams
-    Rooms (MTR) NUCs, reading installers and the wallpaper from a file share.
-    Run elevated as the ADMIN account - the HKCU settings apply only to the
-    account that runs it, not to the Skype/MTR auto-logon account.
+    Standardises Windows shell, power, audio and desktop settings on MTR NUCs,
+    reading the wallpaper, the MTR console, the empty Start layout and the
+    installers off a file share and uploading each run's report back to it. Run
+    elevated as the ADMIN account - the HKCU settings apply only to the account
+    that runs it, not to the Skype/MTR auto-logon account.
 
-    Writes a per-host report into Downloads\_mtrsetup and uploads it to the share.
+    The portable edition (mtr_setup_portable in the same repo) does the same
+    from a USB stick. Both carry the same settings and installs.
 
     Usage:  run-mtr_setup.bat  (or powershell.exe -ExecutionPolicy Bypass -File
             .\mtr-windows-settings.ps1). The share details come from
             network-settings.psd1 next to this script, or from parameters.
 #>
 
-# NOTE: there is no default share host, account or password. Put them in
-#       network-settings.psd1 next to this script (git-ignored - copy
-#       network-settings.example.psd1), or pass them as parameters. The account
-#       is stored in the MTR's credential manager for the Admin user.
+# NOTE: there is no default share host, account, password or VNC password. Put them
+#       in network-settings.psd1 next to this script (git-ignored - copy
+#       network-settings.example.psd1), or pass them as parameters. The share
+#       account is stored in the MTR's credential manager for the Admin user.
 param(
     [string]$ShareHost      = '',                       # file server holding the installers and receiving reports
     [string]$ShareUser      = '',                       # local account on $ShareHost (used as HOST\user)
     [string]$SharePass      = '',
+    [string]$VncPassword    = '',                       # used for both the viewer and admin passwords; VNC auth honours 8 chars max
     [string]$ToolShare      = 'MTR\mtr_setup_network',  # path under \\$ShareHost holding this tool: run-mtr_setup.bat, assets\, logs\
     [string]$SoftwareShare  = 'Software',               # share under \\$ShareHost holding the installers
     [string]$SourceFile,                                # wallpaper - default \\$ShareHost\$ToolShare\assets\wallpaper.png
     [string]$TempFolderName = '_mtrsetup',
-    [string]$ExtronMtrZip,                              # default \\$ShareHost\$SoftwareShare\Extron\MTR\ExtronControlforMicrosoftTeamsRooms_2x5x1.zip
+    [string]$SoftwareFolderName = 'Software',
+    [string]$InstallersRoot,                            # default \\$ShareHost\$SoftwareShare
+    [string]$ExtronMtrZip,                              # default <InstallersRoot>\Extron\MTR\ExtronControlforMicrosoftTeamsRooms_2x5x1.zip
     [string]$ExtronMsiName  = 'ExtronControlforMicrosoftTeamsRooms.msi',
-    [string]$LogiSyncExe,                               # default \\$ShareHost\$SoftwareShare\Logitech\LogiSyncApp-Setup.exe
+    [string]$LogiSyncExe,                               # default <InstallersRoot>\Logitech\LogiSyncApp-Setup.exe
+    [string]$VncMsi,                                    # default <InstallersRoot>\TightVNC\tightvnc-2.8.85-gpl-setup-64bit.msi
+    [string]$FirefoxMsi,                                # default <InstallersRoot>\Firefox\Firefox Setup 140.16.0esr.msi
+    [string]$SevenZipMsi,                               # default <InstallersRoot>\7zip\7z2501-x64.msi
+    [string]$SplashtopExe,                              # default: the Splashtop_Streamer_Windows_DEPLOY_INSTALLER_*.exe in <InstallersRoot>\Splashtop (the team code is in its filename - never rename it)
+    [string]$MmcFile,                                   # default \\$ShareHost\$ToolShare\assets\MTR-MMC-Local.msc
+    [string]$StartPinsFile,                             # default \\$ShareHost\$ToolShare\assets\start2.bin - a start2.bin with nothing pinned, captured from a cleared MTR
     [string]$SetupBat,                                  # default \\$ShareHost\$ToolShare\run-mtr_setup.bat
     [string]$LogShare,                                  # default \\$ShareHost\$ToolShare\logs
-    [int]$DisplayTimeoutMinutes = 3,
-    [switch]$Debug   # extra [diag] console lines for things like the MSI ProductCode lookup
+    [int]$DisplayTimeoutMinutes = 3,                    # display off after (0 = never); also picked in the setup prompt, this is its default
+    [string[]]$Install,          # skip the software prompt and install only these, e.g. -Install Extron,TightVNC (matches the start of the name)
+    [switch]$NoPrompt,           # skip the software prompt and install the default selection (see $UntickedByDefault)
+    [string]$NewHostname,        # if the PC still has a Windows default name (DESKTOP-xxxxxxx), rename it to this without asking
+    [int]$PromptSeconds = 60,    # the prompts carry on with their defaults after this long if nobody touches them
+    [switch]$Debug   # extra [diag] lines for things like the MSI ProductCode lookup
 )
 
-# Bump on every change to this file, format YYYY.MM.DD-NNN.
-$ScriptVersion = '2026.09.27-002'
+# Bump on every change to this file, format YYYY.MM.DD-NNN - same convention
+# as MEETING_ROOM_VERSION/HIVE_VERSION in the meeting_room/HIVE code. Independent
+# counter from the network edition (mtr_setup_network in the vp_mtr-setup-scripts repo).
+$ScriptVersion = '2026.10.23-001'
 
 $ErrorActionPreference = 'Continue'
-Write-Host "mtr-windows-settings.ps1 v$ScriptVersion`n" -ForegroundColor Cyan
+Write-Host "mtr-windows-settings.ps1 v$ScriptVersion (network)`n" -ForegroundColor Cyan
 
 # Site settings: any key in network-settings.psd1 that matches a parameter name
 # sets it, unless it was passed on the command line.
@@ -55,14 +72,20 @@ if (-not ($ShareHost -and $ShareUser -and $SharePass)) {
     Write-Host 'network-settings.psd1 next to this script and fill it in, or pass them as parameters.' -ForegroundColor Red
     exit 2
 }
-if (-not $SourceFile)   { $SourceFile   = "\\$ShareHost\$ToolShare\assets\wallpaper.png" }
-if (-not $ExtronMtrZip) { $ExtronMtrZip = "\\$ShareHost\$SoftwareShare\Extron\MTR\ExtronControlforMicrosoftTeamsRooms_2x5x1.zip" }
-if (-not $LogiSyncExe)  { $LogiSyncExe  = "\\$ShareHost\$SoftwareShare\Logitech\LogiSyncApp-Setup.exe" }
-if (-not $SetupBat)     { $SetupBat     = "\\$ShareHost\$ToolShare\run-mtr_setup.bat" }
-if (-not $LogShare)     { $LogShare     = "\\$ShareHost\$ToolShare\logs" }
-
+if (-not $InstallersRoot) { $InstallersRoot = "\\$ShareHost\$SoftwareShare" }
+if (-not $SourceFile)     { $SourceFile     = "\\$ShareHost\$ToolShare\assets\wallpaper.png" }
+if (-not $ExtronMtrZip)   { $ExtronMtrZip   = "$InstallersRoot\Extron\MTR\ExtronControlforMicrosoftTeamsRooms_2x5x1.zip" }
+if (-not $LogiSyncExe)    { $LogiSyncExe    = "$InstallersRoot\Logitech\LogiSyncApp-Setup.exe" }
+if (-not $VncMsi)         { $VncMsi         = "$InstallersRoot\TightVNC\tightvnc-2.8.85-gpl-setup-64bit.msi" }
+if (-not $FirefoxMsi)     { $FirefoxMsi     = "$InstallersRoot\Firefox\Firefox Setup 140.16.0esr.msi" }
+if (-not $SevenZipMsi)    { $SevenZipMsi    = "$InstallersRoot\7zip\7z2501-x64.msi" }
+if (-not $MmcFile)        { $MmcFile        = "\\$ShareHost\$ToolShare\assets\MTR-MMC-Local.msc" }
+if (-not $StartPinsFile)  { $StartPinsFile  = "\\$ShareHost\$ToolShare\assets\start2.bin" }
+if (-not $SetupBat)       { $SetupBat       = "\\$ShareHost\$ToolShare\run-mtr_setup.bat" }
+if (-not $LogShare)       { $LogShare       = "\\$ShareHost\$ToolShare\logs" }
 $script:Results = @()
 $script:Section = ''
+$script:RestartReasons = @()   # why a restart is needed, added to as the run goes; the launcher restarts instead of logging off when non-empty
 
 function Add-Result {
     param($Name, $Value, $Status = 'OK', $Detail = '')
@@ -118,6 +141,329 @@ function Set-PowerValue {
 
 $Advanced = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
 
+# The wallpaper, MTR console, empty Start layout and installers all live on the
+# share. An elevated session has no share credentials of its own, so map the two
+# roots for the whole run and drop them just before the report is uploaded.
+$shareRoots = @("\\$ShareHost\$(($ToolShare -split '\\')[0])", "\\$ShareHost\$SoftwareShare")
+foreach ($root in $shareRoots) { net use $root /user:"$ShareHost\$ShareUser" "$SharePass" 2>&1 | Out-Null }
+
+# The Splashtop deploy installer carries the team's deployment code in its filename, so
+# it is found by pattern rather than by a fixed name.
+if (-not $SplashtopExe) {
+    $splashFound  = Get-ChildItem -Path "$InstallersRoot\Splashtop" -Filter 'Splashtop_Streamer_Windows_DEPLOY_INSTALLER_*.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $SplashtopExe = if ($splashFound) { $splashFound.FullName } else { "$InstallersRoot\Splashtop\Splashtop_Streamer_Windows_DEPLOY_INSTALLER_VERSION_CODE.exe" }
+}
+$SoftwareChoices = @('Extron Control', 'Logitech Sync', 'TightVNC', 'Firefox ESR', '7-Zip', 'Splashtop Streamer') | Sort-Object   # order shown in the prompt
+
+# Splashtop Streamer starts unticked everywhere, and Yealink MTRs also start with
+# Extron Control and Logitech Sync unticked. Everything is still in the list and
+# can be ticked; the default selection is also what -NoPrompt and an untouched
+# prompt go with, so an unticked item is not installed.
+$maker = try { (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).Manufacturer } catch { '' }
+$UntickedByDefault = @('Splashtop Streamer')
+if ($maker -like '*Yealink*') { $UntickedByDefault += @('Extron Control', 'Logitech Sync') }
+$DefaultSelection = @($SoftwareChoices | Where-Object { $UntickedByDefault -notcontains $_ })
+
+# Version for comparisons: four fields, padded with zeros, so "25.01" and
+# "25.01.00.0" compare equal.
+function ConvertTo-PaddedVersion {
+    param([string]$Text)
+    $parts = @($Text -split '\.' | Select-Object -First 4)
+    while ($parts.Count -lt 4) { $parts += '0' }
+    [version]($parts -join '.')
+}
+
+# Everything that says a restart is pending: what this run recorded plus
+# Windows' own markers (servicing, Windows Update, a renamed computer, files
+# waiting to be replaced).
+function Get-PendingRestartReasons {
+    $reasons = @($script:RestartReasons)
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $reasons += 'Windows servicing update' }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $reasons += 'Windows Update' }
+    $active = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -ErrorAction SilentlyContinue).ComputerName
+    $set    = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction SilentlyContinue).ComputerName
+    if ($active -and $set -and $active -ne $set) { $reasons += 'hostname change' }
+    if ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -ErrorAction SilentlyContinue).PendingFileRenameOperations) { $reasons += 'files to replace on restart' }
+    @($reasons | Select-Object -Unique)
+}
+
+# Setup prompt: tick-boxes for which software to install, plus how long before
+# the display turns off. Shown once, up front, so a tech can choose and walk
+# away: if nobody touches it, it carries on with the ticked items and the
+# installs nothing but still applies the display setting. "Cancel" or closing the window
+# stops the script before anything is changed (exit code 2).
+# installs nothing but still applies the display setting. Returns an object
+# with Software (the ticked names) and DisplayTimeoutMinutes (0 = never).
+function Show-SetupPrompt {
+    param([string[]]$Choices, [string[]]$Unticked = @(), [int]$DisplayMinutes, [int]$Seconds)
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text            = 'MTR setup'
+    $form.StartPosition   = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox     = $false
+    $form.MinimizeBox     = $false
+    $form.TopMost         = $true
+    $form.ClientSize      = New-Object System.Drawing.Size(340, 312)
+
+    $heading          = New-Object System.Windows.Forms.Label
+    $heading.Text     = 'Tick what to install on this MTR:'
+    $heading.Location = New-Object System.Drawing.Point(16, 14)
+    $heading.AutoSize = $true
+
+    $list              = New-Object System.Windows.Forms.CheckedListBox
+    $list.CheckOnClick = $true
+    $list.Location     = New-Object System.Drawing.Point(16, 40)
+    $list.Size         = New-Object System.Drawing.Size(308, 118)
+    foreach ($c in $Choices) { [void]$list.Items.Add($c, ($Unticked -notcontains $c)) }
+
+    $offLabel          = New-Object System.Windows.Forms.Label
+    $offLabel.Text     = 'Turn display off after:'
+    $offLabel.Location = New-Object System.Drawing.Point(16, 172)
+    $offLabel.AutoSize = $true
+
+    # 0 = never. A value passed with -DisplayTimeoutMinutes that isn't in the
+    # usual list is added, so it is never silently changed.
+    $offValues = @(0, 1, 3, 5, 10, 15, 20, 30, 45, 60)
+    if ($offValues -notcontains $DisplayMinutes) { $offValues = @(($offValues + $DisplayMinutes) | Sort-Object) }
+    $off               = New-Object System.Windows.Forms.ComboBox
+    $off.DropDownStyle = 'DropDownList'
+    $off.Location      = New-Object System.Drawing.Point(158, 168)
+    $off.Size          = New-Object System.Drawing.Size(166, 24)
+    foreach ($v in $offValues) {
+        $text = if ($v -eq 0) { 'Never' } elseif ($v -eq 1) { '1 minute' } else { "$v minutes" }
+        [void]$off.Items.Add($text)
+    }
+    $off.SelectedIndex = [array]::IndexOf($offValues, $DisplayMinutes)
+
+    $force          = New-Object System.Windows.Forms.CheckBox
+    $force.Text     = 'Overwrite Hostname'
+    $force.Location = New-Object System.Drawing.Point(16, 204)
+    $force.Size     = New-Object System.Drawing.Size(308, 22)
+
+    $countdown          = New-Object System.Windows.Forms.Label
+    $countdown.Location = New-Object System.Drawing.Point(16, 234)
+    $countdown.Size     = New-Object System.Drawing.Size(308, 20)
+
+    $ok              = New-Object System.Windows.Forms.Button
+    $ok.Text         = 'Config + Software'
+    $ok.Location     = New-Object System.Drawing.Point(16, 268)
+    $ok.Size         = New-Object System.Drawing.Size(136, 28)
+    $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+    $configOnly              = New-Object System.Windows.Forms.Button
+    $configOnly.Text         = 'Config Only'
+    $configOnly.Location     = New-Object System.Drawing.Point(160, 268)
+    $configOnly.Size         = New-Object System.Drawing.Size(96, 28)
+    $configOnly.DialogResult = [System.Windows.Forms.DialogResult]::Ignore
+
+    $cancel              = New-Object System.Windows.Forms.Button
+    $cancel.Text         = 'Cancel'
+    $cancel.Location     = New-Object System.Drawing.Point(264, 268)
+    $cancel.Size         = New-Object System.Drawing.Size(60, 28)
+    $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $form.AcceptButton = $ok
+    $form.CancelButton = $cancel
+    $form.Controls.AddRange(@($heading, $list, $offLabel, $off, $force, $countdown, $ok, $configOnly, $cancel))
+
+    $script:promptLeft = $Seconds
+    $countdown.Text    = "Carrying on with these settings in $($script:promptLeft)s..."
+    $timer          = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 1000
+    $timer.Add_Tick({
+        $script:promptLeft--
+        if ($script:promptLeft -le 0) {
+            $timer.Stop()
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $form.Close()
+        } else {
+            $countdown.Text = "Carrying on with these settings in $($script:promptLeft)s..."
+        }
+    })
+    # Any change means someone is at the keyboard - stop the auto-continue.
+    $list.Add_ItemCheck({ $timer.Stop(); $countdown.Text = '' })
+    $off.Add_SelectedIndexChanged({ $timer.Stop(); $countdown.Text = '' })
+    $force.Add_CheckedChanged({ $timer.Stop(); $countdown.Text = '' })
+    $timer.Start()
+
+    $result  = $form.ShowDialog()
+    $timer.Dispose()
+    $checked = @($list.CheckedItems | ForEach-Object { "$_" })
+    $minutes = $offValues[$off.SelectedIndex]
+    $forceRename = $force.Checked
+    $form.Dispose()
+    $picked = @()
+    if ($result -eq [System.Windows.Forms.DialogResult]::OK) { $picked = $checked }
+    $cancelled = ($result -ne [System.Windows.Forms.DialogResult]::OK -and $result -ne [System.Windows.Forms.DialogResult]::Ignore)
+    [pscustomobject]@{ Software = $picked; DisplayTimeoutMinutes = $minutes; Cancelled = $cancelled; ForceRename = $forceRename }
+}
+
+# Windows names a fresh PC DESKTOP-xxxxxxx. If that is still the name, ask for
+# a proper one and rename. A rename only takes effect after the next restart.
+$DefaultNamePattern = '^DESKTOP-[A-Z0-9]{6,7}$'
+
+# NetBIOS-safe: 1-15 letters/digits/hyphens, no leading or trailing hyphen, not
+# all digits, and not another Windows default name.
+function Test-HostnameValid {
+    param([string]$Name)
+    ($Name -match '^(?!-)(?!\d+$)[A-Za-z0-9-]{1,15}(?<!-)$') -and ($Name -notmatch $DefaultNamePattern)
+}
+
+# Asks for a new hostname. Returns the name, or $null to leave it alone (Keep
+# current name, closing the window, or nobody typing anything for $Seconds).
+function Read-NewHostname {
+    param([string]$Current, [int]$Seconds, [switch]$Forced)
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text            = 'MTR setup - hostname'
+    $form.StartPosition   = 'CenterScreen'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox     = $false
+    $form.MinimizeBox     = $false
+    $form.TopMost         = $true
+    $form.ClientSize      = New-Object System.Drawing.Size(360, 214)
+
+    $info          = New-Object System.Windows.Forms.Label
+    $info.Text     = if ($Forced) { "This PC is named $Current. Enter a new hostname:" } else { "This PC still has the default Windows name ($Current). Enter a new hostname:" }
+    $info.Location = New-Object System.Drawing.Point(16, 14)
+    $info.Size     = New-Object System.Drawing.Size(328, 36)
+
+    $box           = New-Object System.Windows.Forms.TextBox
+    $box.Location  = New-Object System.Drawing.Point(16, 58)
+    $box.Size      = New-Object System.Drawing.Size(328, 24)
+    $box.MaxLength = 15
+
+    $err           = New-Object System.Windows.Forms.Label
+    $err.Text      = 'Letters, numbers and hyphens, up to 15 characters.'
+    $err.Location  = New-Object System.Drawing.Point(16, 90)
+    $err.Size      = New-Object System.Drawing.Size(328, 36)
+
+    $countdown          = New-Object System.Windows.Forms.Label
+    $countdown.Location = New-Object System.Drawing.Point(16, 132)
+    $countdown.Size     = New-Object System.Drawing.Size(328, 20)
+
+    $rename          = New-Object System.Windows.Forms.Button
+    $rename.Text     = 'Rename'
+    $rename.Location = New-Object System.Drawing.Point(96, 170)
+    $rename.Size     = New-Object System.Drawing.Size(110, 28)
+
+    $keep              = New-Object System.Windows.Forms.Button
+    $keep.Text         = 'Keep current name'
+    $keep.Location     = New-Object System.Drawing.Point(214, 170)
+    $keep.Size         = New-Object System.Drawing.Size(130, 28)
+    $keep.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+    $form.AcceptButton = $rename
+    $form.CancelButton = $keep
+    $form.Controls.AddRange(@($info, $box, $err, $countdown, $rename, $keep))
+
+    $script:chosenHostname = $null
+    $rename.Add_Click({
+        $name = $box.Text.Trim()
+        if (Test-HostnameValid $name) {
+            $script:chosenHostname = $name
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+            $form.Close()
+        } else {
+            $err.Text = 'Not valid: letters, numbers and hyphens only, up to 15 characters, not all digits, and not another DESKTOP-xxxxxxx name.'
+        }
+    })
+
+    $script:hostnameLeft = $Seconds
+    $countdown.Text      = "Keeping the current name in $($script:hostnameLeft)s..."
+    $timer          = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 1000
+    $timer.Add_Tick({
+        $script:hostnameLeft--
+        if ($script:hostnameLeft -le 0) {
+            $timer.Stop()
+            $form.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+            $form.Close()
+        } else {
+            $countdown.Text = "Keeping the current name in $($script:hostnameLeft)s..."
+        }
+    })
+    # Typing means someone is at the keyboard - stop the countdown.
+    $box.Add_TextChanged({ $timer.Stop(); $countdown.Text = '' })
+    $timer.Start()
+
+    [void]$form.ShowDialog()
+    $timer.Dispose()
+    $form.Dispose()
+    return $script:chosenHostname
+}
+
+$selected = @($DefaultSelection)
+$ForceHostnameRename = $false
+if ($Install) {
+    $selected = @($SoftwareChoices | Where-Object { $c = $_; @($Install | Where-Object { $c -like "$_*" }).Count })
+}
+elseif (-not $NoPrompt) {
+    try {
+        $choice = Show-SetupPrompt -Choices $SoftwareChoices -Unticked $UntickedByDefault -DisplayMinutes $DisplayTimeoutMinutes -Seconds $PromptSeconds
+        if ($choice.Cancelled) {
+            Write-Host "`nCancelled - nothing was changed." -ForegroundColor Yellow
+            exit 2
+        }
+        $selected = @($choice.Software)
+        $DisplayTimeoutMinutes = $choice.DisplayTimeoutMinutes
+        $ForceHostnameRename = [bool]$choice.ForceRename
+    }
+    catch { Write-Warning "Could not show the setup prompt ($($_.Exception.Message)) - going with the default software selection" }
+}
+$doExtron = $selected -contains 'Extron Control'
+$doLogi   = $selected -contains 'Logitech Sync'
+$doVnc    = $selected -contains 'TightVNC'
+$doFirefox = $selected -contains 'Firefox ESR'
+$do7zip    = $selected -contains '7-Zip'
+$doSplash  = $selected -contains 'Splashtop Streamer'
+
+Write-Section 0 "Hostname"
+$currentHost    = $env:COMPUTERNAME
+$ReportHost     = $currentHost
+$hostChangeNote = $null
+if ($currentHost -notmatch $DefaultNamePattern -and -not $ForceHostnameRename) {
+    Write-Host ("  {0,-42} = {1}" -f 'Hostname', $currentHost)
+    Add-Result 'Hostname' $currentHost 'OK' 'not a Windows default name - left as is'
+}
+else {
+    $newName = $NewHostname
+    if (-not $newName -and -not $NoPrompt) {
+        try { $newName = Read-NewHostname -Current $currentHost -Seconds $PromptSeconds -Forced:($currentHost -notmatch $DefaultNamePattern) }
+        catch { Write-Warning "Could not show the hostname prompt ($($_.Exception.Message))" }
+    }
+    if (-not $newName -or $newName -eq $currentHost) {
+        Write-Host ("  {0,-42} = {1} (left as is)" -f 'Hostname', $currentHost) -ForegroundColor Yellow
+        Add-Result 'Hostname' $currentHost 'SKIP' 'no new name entered'
+    }
+    elseif (-not (Test-HostnameValid $newName)) {
+        Write-Host ("  {0,-42} = FAILED: '{1}' is not a valid hostname" -f 'Hostname', $newName) -ForegroundColor Red
+        Add-Result 'Hostname' $newName 'FAILED' 'not valid: letters, numbers, hyphens; 1-15 characters; not all digits'
+    }
+    else {
+        try {
+            Rename-Computer -NewName $newName -Force -WarningAction SilentlyContinue -ErrorAction Stop
+            $ReportHost     = $newName
+            $hostChangeNote = "$currentHost -> $newName"
+            $script:RestartReasons += 'hostname change'
+            Write-Host ("  {0,-42} = {1} (takes effect after a restart)" -f 'Hostname', $hostChangeNote) -ForegroundColor Green
+            Add-Result 'Hostname' $hostChangeNote 'OK' 'takes effect after a restart'
+        }
+        catch {
+            Write-Host ("  {0,-42} = FAILED: {1}" -f 'Hostname', $_.Exception.Message) -ForegroundColor Red
+            Add-Result 'Hostname' $newName 'FAILED' $_.Exception.Message
+        }
+    }
+}
+
+
 
 # ---------------------------------------------------------------------------
 # 1. PERSONALIZATION > START
@@ -128,6 +474,45 @@ Set-Reg $Advanced 'Start_TrackDocs'            0   # recommended + recent files 
 Set-Reg $Advanced 'Start_IrisRecommendations'  0   # tips, shortcuts, new apps
 Set-Reg $Advanced 'Start_TrackProgs'           0   # most used apps
 Set-Reg $Advanced 'Start_AccountNotifications' 0
+# "Show recently added apps" - newly installed apps (7-Zip, Firefox...) otherwise
+# land in the Recommended section right after the installs. Not an Advanced value.
+Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowRecentList' 0
+Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Start' 'ShowFrequentList' 0
+
+# Hide the Recommended section itself. Policy key - expected to be refused on
+# builds where HKLM Policies is locked to SYSTEM (as for AllowNewsAndInterests).
+$hideRec = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Explorer'
+try {
+    if (-not (Test-Path $hideRec)) { New-Item -Path $hideRec -Force -ErrorAction Stop | Out-Null }
+    Set-ItemProperty -Path $hideRec -Name 'HideRecommendedSection' -Value 1 -Type DWord -ErrorAction Stop
+    Write-Host ("  {0,-42} = 1" -f 'HideRecommendedSection (policy)')
+    Add-Result 'HideRecommendedSection (policy)' 1 'OK' $hideRec
+}
+catch {
+    Write-Host ("  {0,-42} = skipped (Policies locked)" -f 'HideRecommendedSection (policy)') -ForegroundColor DarkGray
+    Add-Result 'HideRecommendedSection (policy)' 1 'SKIP' "$hideRec - $($_.Exception.Message)"
+}
+
+# Empty the Pinned grid (Edge, Outlook, Store, Photos, WhatsApp, LinkedIn ...) by
+# swapping in a start2.bin with nothing pinned. The "Configure Start Pins" policy
+# with an empty list was written and ignored on Windows 11 25H2, so it is not used.
+if (Test-Path -LiteralPath $StartPinsFile) {
+    try {
+        $startState = Join-Path $env:LOCALAPPDATA 'Packages\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\LocalState'
+        Stop-Process -Name StartMenuExperienceHost -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 800
+        Copy-Item -LiteralPath $StartPinsFile -Destination (Join-Path $startState 'start2.bin') -Force -ErrorAction Stop
+        Write-Host ("  {0,-42} = cleared" -f 'Start pinned apps')
+        Add-Result 'Start pinned apps' 'cleared' 'OK' "start2.bin -> $startState"
+    }
+    catch {
+        Write-Host ("  {0,-42} = FAILED: {1}" -f 'Start pinned apps', $_.Exception.Message) -ForegroundColor Red
+        Add-Result 'Start pinned apps' 'clear' 'FAILED' $_.Exception.Message
+    }
+} else {
+    Write-Host ("  {0,-42} = no start2.bin" -f 'Start pinned apps') -ForegroundColor DarkGray
+    Add-Result 'Start pinned apps' 'no start2.bin' 'SKIP' "not found: $StartPinsFile"
+}
 
 # Folders shown next to the Power button. This build does not read the
 # classic per-user values (Start_Show*, tested above) or the HKLM GPO
@@ -270,16 +655,19 @@ try {
     if (-not $personalizationItem) {
         throw "Could not find Personalization in the Settings nav. Settings showed: $(Get-SettingsSeen $startFoldersRoot)"
     }
-    Invoke-AutomationElement $personalizationItem
-
     $startItemCond = New-Object System.Windows.Automation.AndCondition(
         (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)),
         (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty, 'Start'))
     )
+    # On a slow-loading page (seen on 24H2 with the Ethernet page open) the first
+    # click can be swallowed, so click again if Start has not appeared.
     $startItem = $null
-    for ($i = 0; $i -lt 20 -and -not $startItem; $i++) {
-        Start-Sleep -Milliseconds 500
-        $startItem = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $startItemCond)
+    for ($attempt = 0; $attempt -lt 3 -and -not $startItem; $attempt++) {
+        Invoke-AutomationElement $personalizationItem
+        for ($i = 0; $i -lt 10 -and -not $startItem; $i++) {
+            Start-Sleep -Milliseconds 500
+            $startItem = $startFoldersRoot.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $startItemCond)
+        }
     }
     if (-not $startItem) { throw "Could not find Start in the Personalization list. Settings showed: $(Get-SettingsSeen $startFoldersRoot)" }
     Invoke-AutomationElement $startItem
@@ -344,10 +732,600 @@ if ($startFoldersRoot) {
 
 
 # ---------------------------------------------------------------------------
-# 2. PERSONALIZATION > TASKBAR - items
+# 2. FILE EXPLORER
 # ---------------------------------------------------------------------------
-Write-Section 2 "Taskbar items"
+Write-Section 2 "File Explorer"
 
+Set-Reg $Advanced 'HideFileExt' 0   # show file name extensions
+
+
+# ---------------------------------------------------------------------------
+# 3. POWER
+# ---------------------------------------------------------------------------
+Write-Section 3 "Power"
+
+$scheme = [regex]::Match((powercfg /getactivescheme), '[0-9a-fA-F-]{36}').Value
+Write-Host "  Active scheme                              = $scheme"
+
+# /change applies to the live scheme immediately
+powercfg /change standby-timeout-ac   0
+powercfg /change standby-timeout-dc   0
+powercfg /change hibernate-timeout-ac 0
+powercfg /change hibernate-timeout-dc 0
+powercfg /change monitor-timeout-ac   $DisplayTimeoutMinutes
+powercfg /change monitor-timeout-dc   $DisplayTimeoutMinutes
+
+Write-Host "  Sleep / hibernate                          = never"
+$displayOffText = if ($DisplayTimeoutMinutes -eq 0) { 'never' } else { "$DisplayTimeoutMinutes min" }
+Write-Host "  Display off after                          = $displayOffText"
+Add-Result 'Sleep (standby)'   'never'          'OK' "scheme $scheme"
+Add-Result 'Hibernate'         'never'          'OK' "scheme $scheme"
+Add-Result 'Display off after' $displayOffText  'OK' "scheme $scheme"
+
+Set-PowerValue $scheme 'USB selective suspend'      '2a737441-1930-4402-8d77-b2bebba308a3' '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' 0
+Set-PowerValue $scheme 'Hybrid sleep'               '238c9fa8-0aad-41ed-83f4-97be242c8f20' '94ac6d29-73ce-41a6-809f-6363ba21b47e' 0
+Set-PowerValue $scheme 'PCIe link state power mgmt' '501a4d13-42af-4429-9fd1-a8218c268e20' 'ee12f906-d277-404b-b6da-e5fa1a576df5' 0
+Set-PowerValue $scheme 'Unattended sleep timeout'   '238c9fa8-0aad-41ed-83f4-97be242c8f20' '7bc4a2f9-d8fc-4469-b07b-33eb785aaca0' 0
+
+# Required - without this the Set-PowerValue writes above never reach the
+# running system.
+& powercfg /setactive $scheme | Out-Null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "  Scheme re-activated                        = yes"
+    Add-Result 'Power scheme activated' 'yes' 'OK' $scheme
+} else {
+    Write-Host "  Scheme re-activated                        = FAILED" -ForegroundColor Red
+    Add-Result 'Power scheme activated' 'no' 'FAILED' "powercfg /setactive $scheme returned $LASTEXITCODE"
+}
+
+# Let the Tap's sensors wake the NUC. Not every NUC has both devices. powercfg
+# lists a device with an instance suffix when there is more than one of that
+# name (e.g. "HID-compliant touch screen (001)") and only accepts that full name.
+$wakeProgrammable = @(& powercfg /devicequery wake_programmable 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+foreach ($want in @('HID Human Presence Sensor', 'HID-compliant touch screen')) {
+    $names = @($wakeProgrammable | Where-Object { $_ -eq $want -or $_ -like "$want (*)" })
+    if (-not $names.Count) {
+        Write-Host ("  {0,-42} = not present" -f $want) -ForegroundColor DarkGray
+        Add-Result "Wake: $want" 'not present' 'SKIP' 'not in the wake-programmable device list'
+        continue
+    }
+    foreach ($dev in $names) {
+        $out = & powercfg /deviceenablewake $dev 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host ("  {0,-42} = wake enabled" -f $dev)
+            Add-Result "Wake: $dev" 'enabled' 'OK' ''
+        } else {
+            Write-Host ("  {0,-42} = FAILED" -f $dev) -ForegroundColor Red
+            Add-Result "Wake: $dev" 'enable' 'FAILED' (($out | Where-Object { $_ }) -join ' ')
+        }
+    }
+}
+# Stop Windows powering down USB devices - keeps the Tap, camera and mic on the bus
+try {
+    $powerMgmt = @(Get-CimInstance -ClassName MSPower_DeviceEnable -Namespace root/WMI -ErrorAction Stop)
+    $usbDevs   = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter 'PNPClass = "USB"' -ErrorAction Stop)
+    $targets   = @($usbDevs | ForEach-Object {
+                     $id = $_.PNPDeviceID
+                     $powerMgmt | Where-Object InstanceName -Like "*$id*"
+                  })
+    if ($targets.Count) {
+        $targets | Set-CimInstance -Property @{ Enable = $false } -ErrorAction Stop
+    }
+    Write-Host "  USB power saving disabled on               = $($targets.Count) device(s)"
+    Add-Result 'USB power saving' "disabled on $($targets.Count)" 'OK' "$($usbDevs.Count) USB devices enumerated"
+}
+catch {
+    Write-Host "  USB power saving                           = FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Add-Result 'USB power saving' 'disable' 'FAILED' $_.Exception.Message
+}
+
+Set-Reg 'HKLM:\System\CurrentControlSet\Control\Power' 'PlatformAoAcOverride' 0   # disable Modern Standby
+
+
+# ---------------------------------------------------------------------------
+# 4. SHORTCUTS AND FOLDER STRUCTURE
+# ---------------------------------------------------------------------------
+Write-Section 4 "Shortcuts and Folder Structure"
+
+# Resolve the real Downloads path (survives folder redirection)
+$dlKey  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+$dlGuid = '{374DE290-123F-4565-9164-39C4925E467B}'
+$downloads = (Get-ItemProperty -Path $dlKey -Name $dlGuid -ErrorAction SilentlyContinue).$dlGuid
+if ($downloads) { $downloads = [Environment]::ExpandEnvironmentVariables($downloads) }
+else            { $downloads = Join-Path $env:USERPROFILE 'Downloads' }
+Write-Host "  Downloads  = $downloads"
+
+$workDir = Join-Path $downloads $TempFolderName
+New-Item -Path $workDir -ItemType Directory -Force | Out-Null
+Write-Host "  created    = $workDir"
+Add-Result 'Temp folder' $TempFolderName 'OK' $workDir
+
+# Desktop shortcut to the work folder, so the reports and installer logs are one click away.
+$folderLnkPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "$TempFolderName.lnk"
+$folderLnk = (New-Object -ComObject WScript.Shell).CreateShortcut($folderLnkPath)
+$folderLnk.TargetPath  = $workDir
+$folderLnk.Description = "MTR setup work folder - $workDir"
+$folderLnk.Save()
+Write-Host "  shortcut   = $folderLnkPath  ->  $workDir"
+Add-Result 'Shortcut' ([IO.Path]::GetFileName($folderLnkPath)) 'OK' "$folderLnkPath -> $workDir"
+
+# MTR management console - kept in _mtrsetup, with a Desktop shortcut to that copy.
+$mmcName = [IO.Path]::GetFileName($MmcFile)
+if (Test-Path $MmcFile) {
+    Copy-Item -Path $MmcFile -Destination $workDir -Force
+    $mmcLocal = Join-Path $workDir $mmcName
+    Write-Host "  copied $mmcName -> $workDir" -ForegroundColor Green
+    Add-Result 'MMC console' $mmcName 'OK' "$MmcFile -> $workDir"
+
+    $mmcLnkPath = Join-Path ([Environment]::GetFolderPath('Desktop')) ([IO.Path]::GetFileNameWithoutExtension($mmcName) + '.lnk')
+    $wsh = New-Object -ComObject WScript.Shell
+    $mmcLnk = $wsh.CreateShortcut($mmcLnkPath)
+    $mmcLnk.TargetPath       = $mmcLocal
+    $mmcLnk.WorkingDirectory = $workDir
+    $mmcLnk.Description      = 'MTR management console'
+    $mmcLnk.Save()
+    Write-Host "  shortcut   = $mmcLnkPath  ->  $mmcLocal"
+    Add-Result 'Shortcut' ([IO.Path]::GetFileName($mmcLnkPath)) 'OK' "$mmcLnkPath -> $mmcLocal"
+} else {
+    Write-Warning "Not found on the share: $MmcFile"
+    Add-Result 'MMC console' $mmcName 'FAILED' "not found: $MmcFile"
+}
+
+
+
+# Stash the share credential so the shortcut opens without a prompt
+cmdkey /delete:$ShareHost 2>&1 | Out-Null
+cmdkey /add:$ShareHost /user:"$ShareHost\$ShareUser" /pass:"$SharePass" | Out-Null
+Write-Host "  credential = $ShareHost\$ShareUser  (stored for $env:USERNAME)"
+Add-Result 'Stored credential' "$ShareHost\$ShareUser" 'OK' "for $env:USERNAME"
+
+$lnkTarget = "\\$ShareHost\$SoftwareShare"
+$lnkPath   = Join-Path $workDir "$SoftwareShare on $ShareHost.lnk"
+$wsh = New-Object -ComObject WScript.Shell
+$lnk = $wsh.CreateShortcut($lnkPath)
+$lnk.TargetPath  = $lnkTarget
+$lnk.Description = "Software share - $lnkTarget"
+$lnk.Save()
+Write-Host "  shortcut   = $lnkPath  ->  $lnkTarget"
+Add-Result 'Shortcut' ([IO.Path]::GetFileName($lnkPath)) 'OK' "$lnkPath -> $lnkTarget"
+
+# Points at the network copy (not the C:\Scripts staged copy) so re-running
+# it always picks up whatever this script currently does.
+$setupLnkPath = Join-Path $workDir 'run-mtr_setup.bat - Shortcut.lnk'
+$setupLnk = $wsh.CreateShortcut($setupLnkPath)
+$setupLnk.TargetPath  = $SetupBat
+$setupLnk.Description = "Re-run MTR setup - $SetupBat"
+$setupLnk.Save()
+Write-Host "  shortcut   = $setupLnkPath  ->  $SetupBat"
+Add-Result 'Shortcut' ([IO.Path]::GetFileName($setupLnkPath)) 'OK' "$setupLnkPath -> $SetupBat"
+
+# Root of the share, on the Desktop rather than in _mtrsetup - meant to be
+# visible without digging through Downloads.
+$desktop         = [Environment]::GetFolderPath('Desktop')
+$shareRootTarget = "\\$ShareHost"
+$shareRootLnkPath = Join-Path $desktop "$ShareHost share.lnk"
+$shareRootLnk = $wsh.CreateShortcut($shareRootLnkPath)
+$shareRootLnk.TargetPath  = $shareRootTarget
+$shareRootLnk.Description = "MTR share - $shareRootTarget"
+$shareRootLnk.Save()
+Write-Host "  shortcut   = $shareRootLnkPath  ->  $shareRootTarget"
+Add-Result 'Shortcut' ([IO.Path]::GetFileName($shareRootLnkPath)) 'OK' "$shareRootLnkPath -> $shareRootTarget"
+
+
+# ---------------------------------------------------------------------------
+# 5. SOFTWARE INSTALLS
+# ---------------------------------------------------------------------------
+Write-Section 5 "Software installs"
+
+$selectedText = if ($selected.Count) { $selected -join ', ' } else { 'none' }
+Write-Host ("  {0,-42} = {1}" -f 'Selected', $selectedText)
+Add-Result 'Software selected' $selectedText 'OK' ''
+
+$softwareFolder = Join-Path $workDir $SoftwareFolderName
+New-Item -Path $softwareFolder -ItemType Directory -Force | Out-Null
+Write-Host "  created    = $softwareFolder"
+Add-Result 'Software folder' $SoftwareFolderName 'OK' $softwareFolder
+
+# Helpers for the install blocks below, which run in alphabetical order so the
+# report lists them that way. Every install waits for its installer to finish,
+# so the end-of-script logoff/restart can't cut one off mid-way.
+function Test-AppInstalled {
+    param([string]$NameLike)
+    $uninstallPaths = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -like $NameLike } |
+        Select-Object -First 1
+}
+
+# Reads a summary property straight out of the MSI's own database, rather
+# than trusting the zip's filename.
+function Get-MsiProperty {
+    param([string]$Path, [string]$Property)
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $db     = $installer.OpenDatabase($Path, 0)
+        $view   = $db.OpenView("SELECT Value FROM Property WHERE Property = '$Property'")
+        [void]$view.Execute()
+        $record = $view.Fetch()
+        if ($record) { return $record.StringData(1).Trim() }
+    }
+    catch { }
+    return $null
+}
+
+# 7-Zip - MSI, judged by version like Firefox: same or newer is left alone.
+$szName = [IO.Path]::GetFileName($SevenZipMsi)
+if (-not $do7zip) {
+    Write-Host ("  {0,-42} = not selected" -f '7-Zip')
+    Add-Result '7-Zip' 'not selected' 'SKIP' 'unticked in the software prompt'
+}
+elseif (-not (Test-Path $SevenZipMsi)) {
+    Write-Warning "Not found on the share: $SevenZipMsi"
+    Add-Result '7-Zip install' $szName 'FAILED' "not found: $SevenZipMsi"
+}
+else {
+    $szVersion   = Get-MsiProperty $SevenZipMsi 'ProductVersion'
+    $szInstalled = Test-AppInstalled '*7-Zip*'
+    $szUpToDate  = $false
+    if ($szInstalled -and $szInstalled.DisplayVersion -and $szVersion) {
+        try { $szUpToDate = (ConvertTo-PaddedVersion $szInstalled.DisplayVersion) -ge (ConvertTo-PaddedVersion $szVersion) } catch { }
+    }
+    if ($szUpToDate) {
+        Write-Host ("  {0,-42} = already installed ({1})" -f '7-Zip', $szInstalled.DisplayVersion)
+        Add-Result '7-Zip install' "already installed ($($szInstalled.DisplayVersion))" 'OK' ''
+    } else {
+        Copy-Item -Path $SevenZipMsi -Destination $softwareFolder -Force
+        $szPath   = Join-Path $softwareFolder $szName
+        $szLog    = Join-Path $softwareFolder '7-ZipInstall.log'
+        $szAction = if ($szInstalled) { "upgrading $($szInstalled.DisplayVersion) -> $szVersion" } else { "installing $szVersion" }
+        Write-Host ("  {0,-42} = {1}" -f '7-Zip', $szAction) -ForegroundColor Yellow
+        $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$szPath`"", '/qn', '/norestart', '/l*v', "`"$szLog`"") -Wait -PassThru
+        if ($p.ExitCode -in 0, 3010) { if ($p.ExitCode -eq 3010) { $script:RestartReasons += 'an installer asked for a restart' }
+            Write-Host ("  {0,-42} = installed (exit {1})" -f '7-Zip', $p.ExitCode) -ForegroundColor Green
+            Add-Result '7-Zip install' "$szAction (exit $($p.ExitCode))" 'OK' $szLog
+        } else {
+            Write-Host ("  {0,-42} = FAILED (exit {1})" -f '7-Zip', $p.ExitCode) -ForegroundColor Red
+            Add-Result '7-Zip install' "exit $($p.ExitCode)" 'FAILED' "see $szLog"
+        }
+    }
+}
+
+# Extron Teams MTR app - copied down and extracted into the Software folder
+$zipName = [IO.Path]::GetFileName($ExtronMtrZip)
+
+if (-not $doExtron) {
+    Write-Host ("  {0,-42} = not selected" -f 'Extron Control')
+    Add-Result 'Extron Control' 'not selected' 'SKIP' 'unticked in the software prompt'
+} elseif (Test-Path $ExtronMtrZip) {
+    Copy-Item -Path $ExtronMtrZip -Destination $softwareFolder -Force
+    Write-Host "  copied $zipName -> $softwareFolder" -ForegroundColor Green
+    Add-Result 'Extron Teams MTR zip' $zipName 'OK' "$ExtronMtrZip -> $softwareFolder"
+
+    $zipLocal    = Join-Path $softwareFolder $zipName
+    $extractTemp = Join-Path $softwareFolder '_extract_tmp'
+    try {
+        Expand-Archive -Path $zipLocal -DestinationPath $extractTemp -Force -ErrorAction Stop
+        # .msi (not .exe) - it's a plain Windows Installer package, so it
+        # can be driven silently via msiexec rather than the double-click
+        # .exe wrapper. See "Installer Read Me.txt" inside the zip.
+        $msi = Get-ChildItem -Path $extractTemp -Filter '*.msi' -Recurse -File | Select-Object -First 1
+        if ($msi) {
+            # Copied under a fixed name, not the zip's versioned filename
+            # (e.g. "..._v2x5x1.msi") - Windows Installer caches the exact
+            # source filename a product was installed from, and a repair
+            # later resolves against that cached name. A mismatch there
+            # fails with "SecureRepair Failed" / ProcessComponents return 3
+            # (surfaces as msiexec exit 1603), confirmed on MTR-10-05.
+            $msi = Copy-Item -Path $msi.FullName -Destination (Join-Path $softwareFolder $ExtronMsiName) -Force -PassThru
+            Write-Host ("  extracted  = {0} -> {1}" -f $msi.Name, $softwareFolder) -ForegroundColor Green
+            Add-Result 'Extron Teams MTR extract' $msi.Name 'OK' $msi.FullName
+
+            Remove-Item -Path $zipLocal -Force -ErrorAction SilentlyContinue
+            Write-Host "  removed    = $zipLocal"
+        } else {
+            Write-Host "  extract FAILED: no .msi found in $zipName" -ForegroundColor Red
+            Add-Result 'Extron Teams MTR extract' $zipName 'FAILED' 'no .msi found inside the archive'
+        }
+    }
+    catch {
+        Write-Host "  extract FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        Add-Result 'Extron Teams MTR extract' $zipName 'FAILED' $_.Exception.Message
+    }
+    finally {
+        Remove-Item -Path $extractTemp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+} else {
+    Write-Warning "Not found on the share: $ExtronMtrZip"
+    Add-Result 'Extron Teams MTR zip' $zipName 'FAILED' "not found: $ExtronMtrZip"
+}
+
+if ($msi) {
+    $msiPath        = Join-Path $softwareFolder $msi.Name
+    $msiLog         = Join-Path $softwareFolder 'ExtronInstall.log'
+    $packageVersion = Get-MsiProperty $msiPath 'ProductVersion'
+    $productCode    = Get-MsiProperty $msiPath 'ProductCode'
+
+    # Ask Windows Installer directly whether this exact ProductCode is
+    # registered, rather than pattern-matching the Uninstall registry's
+    # DisplayName - that missed a real install on MTR-10-05 whose DisplayName
+    # didn't match '*Extron Control*', and disagreeing with Windows Installer
+    # here is exactly what leads to msiexec refusing with 1638 below.
+    $installedVersion = $null
+    $productState     = $null
+    $productStateErr  = $null
+    if ($productCode) {
+        try {
+            $installerCom = New-Object -ComObject WindowsInstaller.Installer
+            $productState = $installerCom.ProductState($productCode)
+            if ($productState -eq 5) {
+                $installedVersion = $installerCom.ProductInfo($productCode, 'VersionString')
+            }
+        }
+        catch { $productStateErr = $_.Exception.Message }
+    }
+    if ($Debug) {
+        Write-Host ("  [diag] ProductCode={0} ProductState={1} InstalledVersion={2} Error={3}" -f `
+            $productCode, $productState, $installedVersion, $productStateErr) -ForegroundColor DarkGray
+    }
+
+    # Windows Installer's own version comparisons only honour the first three
+    # fields (Major.Minor.Build) of ProductVersion - a 4th field is legal but
+    # ignored for product-identity purposes. Truncate both sides the same way
+    # before comparing, or a package whose metadata carries a 4th field (e.g.
+    # 2.5.1.1) reads as "newer" than an installed 2.5.1 that MSI itself
+    # considers identical - which is what led to the same install being
+    # attempted twice on MTR-10-05 (1638, then 1603 on the forced repair).
+    function ConvertTo-MsiVersion {
+        param([string]$VersionString)
+        if (-not $VersionString) { return $null }
+        $parts = @($VersionString -split '\.')[0..2]
+        return [version]($parts -join '.')
+    }
+
+    # Only treat it as up to date if both versions actually parsed and the
+    # installed one is not older - anything else (not installed, older, or
+    # version unreadable either side) falls through to installing/upgrading.
+    $upToDate = $false
+    if ($installedVersion -and $packageVersion) {
+        try { $upToDate = (ConvertTo-MsiVersion $installedVersion) -ge (ConvertTo-MsiVersion $packageVersion) }
+        catch { $upToDate = $false }
+    }
+
+    if ($upToDate) {
+        Write-Host ("  {0,-42} = already installed ({1})" -f 'Extron Control', $installedVersion)
+        Add-Result 'Extron Control install' "already installed ($installedVersion)" 'OK' $installedVersion
+    } else {
+        $action = if ($installedVersion) { "upgrading $installedVersion -> $packageVersion" } else { "installing $packageVersion" }
+        Write-Host ("  {0,-42} = {1}" -f 'Extron Control', $action) -ForegroundColor Yellow
+        $msiArgs = @('/i', "`"$msiPath`"", '/qn', '/norestart', '/l*v', "`"$msiLog`"")
+        $p = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+
+        if ($p.ExitCode -eq 1638) {
+            # ERROR_PRODUCT_VERSION - a build already on the machine shares this package's
+            # ProductCode, so plain /i refuses it outright. /f (repair) is what MSI expects
+            # to bring a same-ProductCode install forward to a different package's version.
+            Write-Host ("  {0,-42} = same product code installed, repairing to {1}" -f 'Extron Control', $packageVersion) -ForegroundColor Yellow
+            $repairArgs = @('/fvomus', "`"$msiPath`"", '/qn', '/norestart', '/l*v', "`"$msiLog`"")
+            $p = Start-Process msiexec.exe -ArgumentList $repairArgs -Wait -PassThru
+        }
+
+        if ($p.ExitCode -in 0, 3010) { if ($p.ExitCode -eq 3010) { $script:RestartReasons += 'an installer asked for a restart' }
+            Write-Host ("  {0,-42} = installed (exit {1})" -f 'Extron Control', $p.ExitCode) -ForegroundColor Green
+            Add-Result 'Extron Control install' "$action (exit $($p.ExitCode))" 'OK' $msiLog
+        } else {
+            Write-Host ("  {0,-42} = FAILED (exit {1})" -f 'Extron Control', $p.ExitCode) -ForegroundColor Red
+            Add-Result 'Extron Control install' "exit $($p.ExitCode)" 'FAILED' "see $msiLog"
+        }
+    }
+}
+
+# Firefox ESR - judged by version from the installed-programs list, which sees
+# both MSI and regular-installer copies. (MSI ProductState can't be used: every
+# Firefox MSI shares one ProductCode, and an .exe install isn't an MSI at all.)
+# Same or newer is left alone; older is upgraded by the install.
+$ffName = [IO.Path]::GetFileName($FirefoxMsi)
+if (-not $doFirefox) {
+    Write-Host ("  {0,-42} = not selected" -f 'Firefox ESR')
+    Add-Result 'Firefox ESR' 'not selected' 'SKIP' 'unticked in the software prompt'
+}
+elseif (-not (Test-Path $FirefoxMsi)) {
+    Write-Warning "Not found on the share: $FirefoxMsi"
+    Add-Result 'Firefox install' $ffName 'FAILED' "not found: $FirefoxMsi"
+}
+else {
+    $ffVersion   = Get-MsiProperty $FirefoxMsi 'ProductVersion'
+    $ffInstalled = Test-AppInstalled '*Mozilla Firefox*'
+    $ffUpToDate  = $false
+    if ($ffInstalled -and $ffInstalled.DisplayVersion -and $ffVersion) {
+        try { $ffUpToDate = (ConvertTo-PaddedVersion $ffInstalled.DisplayVersion) -ge (ConvertTo-PaddedVersion $ffVersion) } catch { }
+    }
+    if ($ffUpToDate) {
+        Write-Host ("  {0,-42} = already installed ({1})" -f 'Firefox ESR', $ffInstalled.DisplayVersion)
+        Add-Result 'Firefox install' "already installed ($($ffInstalled.DisplayVersion))" 'OK' ''
+    } else {
+        Copy-Item -Path $FirefoxMsi -Destination $softwareFolder -Force
+        $ffPath = Join-Path $softwareFolder $ffName
+        $ffLog  = Join-Path $softwareFolder 'FirefoxInstall.log'
+        $ffAction = if ($ffInstalled) { "upgrading $($ffInstalled.DisplayVersion) -> $ffVersion" } else { "installing $ffVersion" }
+        Write-Host ("  {0,-42} = {1}" -f 'Firefox ESR', $ffAction) -ForegroundColor Yellow
+        $p = Start-Process msiexec.exe -ArgumentList @('/i', "`"$ffPath`"", '/qn', '/norestart', '/l*v', "`"$ffLog`"") -Wait -PassThru
+        if ($p.ExitCode -in 0, 3010) { if ($p.ExitCode -eq 3010) { $script:RestartReasons += 'an installer asked for a restart' }
+            Write-Host ("  {0,-42} = installed (exit {1})" -f 'Firefox ESR', $p.ExitCode) -ForegroundColor Green
+            Add-Result 'Firefox install' "$ffAction (exit $($p.ExitCode))" 'OK' $ffLog
+        } else {
+            Write-Host ("  {0,-42} = FAILED (exit {1})" -f 'Firefox ESR', $p.ExitCode) -ForegroundColor Red
+            Add-Result 'Firefox install' "exit $($p.ExitCode)" 'FAILED' "see $ffLog"
+        }
+    }
+}
+
+# Logitech Sync installer - straight copy, no extraction needed
+$logiName = [IO.Path]::GetFileName($LogiSyncExe)
+if (-not $doLogi) {
+    Write-Host ("  {0,-42} = not selected" -f 'Logitech Sync')
+    Add-Result 'Logitech Sync' 'not selected' 'SKIP' 'unticked in the software prompt'
+} elseif (Test-Path $LogiSyncExe) {
+    Copy-Item -Path $LogiSyncExe -Destination $softwareFolder -Force
+    Write-Host "  copied $logiName -> $softwareFolder" -ForegroundColor Green
+    Add-Result 'Logitech Sync installer' $logiName 'OK' "$LogiSyncExe -> $softwareFolder"
+} else {
+    Write-Warning "Not found on the share: $LogiSyncExe"
+    Add-Result 'Logitech Sync installer' $logiName 'FAILED' "not found: $LogiSyncExe"
+}
+
+if ($doLogi -and (Test-Path (Join-Path $softwareFolder $logiName))) {
+    $logiInstalled = Test-AppInstalled '*Logitech Sync*'
+    if ($logiInstalled) {
+        $ver = if ($logiInstalled.DisplayVersion) { " ($($logiInstalled.DisplayVersion))" } else { '' }
+        Write-Host ("  {0,-42} = already installed{1}" -f 'Logitech Sync', $ver)
+        Add-Result 'Logitech Sync install' "already installed$ver" 'OK' $logiInstalled.DisplayVersion
+    } else {
+        Write-Host ("  {0,-42} = launching installer" -f 'Logitech Sync') -ForegroundColor Yellow
+        Start-Process -FilePath (Join-Path $softwareFolder $logiName) -Wait
+        Add-Result 'Logitech Sync install' 'launched installer' 'OK' $logiName
+    }
+}
+
+# Splashtop Streamer - the DEPLOY installer carries this team's deployment code
+# in its filename, so it is copied and run under its original name. prevercheck
+# makes it upgrade an existing Streamer in place. Version comes from the exe's
+# ProductVersion (FileVersion is a different scheme, e.g. 3.74.4.29).
+$spName = [IO.Path]::GetFileName($SplashtopExe)
+if (-not $doSplash) {
+    Write-Host ("  {0,-42} = not selected" -f 'Splashtop Streamer')
+    Add-Result 'Splashtop Streamer' 'not selected' 'SKIP' 'unticked in the software prompt'
+}
+elseif (-not (Test-Path $SplashtopExe)) {
+    Write-Warning "Not found on the share: $SplashtopExe"
+    Add-Result 'Splashtop install' $spName 'FAILED' "not found: $SplashtopExe"
+}
+else {
+    $spVersion = (Get-Item $SplashtopExe).VersionInfo.ProductVersion
+    if (-not $spVersion -and $spName -match '_v([\d.]+)_') { $spVersion = $Matches[1] }
+    $spInstalled = Test-AppInstalled '*Splashtop*Streamer*'
+    $spUpToDate  = $false
+    if ($spInstalled -and $spInstalled.DisplayVersion -and $spVersion) {
+        try { $spUpToDate = (ConvertTo-PaddedVersion $spInstalled.DisplayVersion) -ge (ConvertTo-PaddedVersion $spVersion) } catch { }
+    }
+    if ($spUpToDate) {
+        Write-Host ("  {0,-42} = already installed ({1})" -f 'Splashtop Streamer', $spInstalled.DisplayVersion)
+        Add-Result 'Splashtop install' "already installed ($($spInstalled.DisplayVersion))" 'OK' ''
+    } else {
+        Copy-Item -Path $SplashtopExe -Destination $softwareFolder -Force
+        $spPath   = Join-Path $softwareFolder $spName
+        $spAction = if ($spInstalled) { "upgrading $($spInstalled.DisplayVersion) -> $spVersion" } else { "installing $spVersion" }
+        Write-Host ("  {0,-42} = {1}" -f 'Splashtop Streamer', $spAction) -ForegroundColor Yellow
+        $p = Start-Process -FilePath $spPath -ArgumentList @('prevercheck', '/s', '/i', 'confirm_d=0,hidewindow=1') -Wait -PassThru
+        if ($p.ExitCode -in 0, 3010) { if ($p.ExitCode -eq 3010) { $script:RestartReasons += 'an installer asked for a restart' }
+            Write-Host ("  {0,-42} = installed (exit {1})" -f 'Splashtop Streamer', $p.ExitCode) -ForegroundColor Green
+            Add-Result 'Splashtop install' "$spAction (exit $($p.ExitCode))" 'OK' $spName
+        } else {
+            Write-Host ("  {0,-42} = FAILED (exit {1})" -f 'Splashtop Streamer', $p.ExitCode) -ForegroundColor Red
+            Add-Result 'Splashtop install' "exit $($p.ExitCode)" 'FAILED' "exit code from $spName"
+        }
+    }
+}
+
+# TightVNC server - skipped if any TightVNC is already on the machine, so an
+# existing config and password are never overwritten. Wallpaper handling is
+# set afterwards in the Remote management section.
+$vncName      = [IO.Path]::GetFileName($VncMsi)
+$vncInstalled = Test-AppInstalled '*TightVNC*'
+if (-not $doVnc) {
+    Write-Host ("  {0,-42} = not selected" -f 'TightVNC')
+    Add-Result 'TightVNC' 'not selected' 'SKIP' 'unticked in the software prompt'
+}
+elseif ($vncInstalled) {
+    $ver = if ($vncInstalled.DisplayVersion) { " ($($vncInstalled.DisplayVersion))" } else { '' }
+    Write-Host ("  {0,-42} = already installed{1}" -f 'TightVNC', $ver)
+    Add-Result 'TightVNC install' "already installed$ver" 'OK' $vncInstalled.DisplayVersion
+}
+elseif (-not (Test-Path $VncMsi)) {
+    Write-Warning "Not found on the share: $VncMsi"
+    Add-Result 'TightVNC install' $vncName 'FAILED' "not found: $VncMsi"
+}elseif (-not $VncPassword) {
+    Write-Host ("  {0,-42} = FAILED: no VNC password supplied" -f 'TightVNC') -ForegroundColor Red
+    Add-Result 'TightVNC install' 'no VNC password' 'FAILED' 'set VncPassword in network-settings.psd1, or pass -VncPassword'
+}
+else {
+    Copy-Item -Path $VncMsi -Destination $softwareFolder -Force
+    $vncPath = Join-Path $softwareFolder $vncName
+    $vncLog  = Join-Path $softwareFolder 'TightVNCInstall.log'
+    Write-Host ("  {0,-42} = installing silently" -f 'TightVNC') -ForegroundColor Yellow
+    # /le logs errors only - a fuller log would record the password properties.
+    $vncArgs = @('/i', "`"$vncPath`"", '/qn', '/norestart', '/le', "`"$vncLog`"",
+                 'ADDLOCAL=Server', 'SERVER_REGISTER_AS_SERVICE=1', 'SERVER_ADD_FIREWALL_EXCEPTION=1', 'SERVER_ALLOW_SAS=1',
+                 'SET_USEVNCAUTHENTICATION=1', 'VALUE_OF_USEVNCAUTHENTICATION=1',
+                 'SET_PASSWORD=1', "VALUE_OF_PASSWORD=$VncPassword",
+                 'SET_USECONTROLAUTHENTICATION=1', 'VALUE_OF_USECONTROLAUTHENTICATION=1',
+                 'SET_CONTROLPASSWORD=1', "VALUE_OF_CONTROLPASSWORD=$VncPassword",
+                 'SET_REMOVEWALLPAPER=1', 'VALUE_OF_REMOVEWALLPAPER=0',           # "Hide desktop wallpaper" off from the first start
+                 'SET_ACCEPTHTTPCONNECTIONS=1', 'VALUE_OF_ACCEPTHTTPCONNECTIONS=0')   # "Serve Java Viewer to Web clients" off
+    $p = Start-Process msiexec.exe -ArgumentList $vncArgs -Wait -PassThru
+    if ($p.ExitCode -in 0, 3010) { if ($p.ExitCode -eq 3010) { $script:RestartReasons += 'an installer asked for a restart' }
+        Write-Host ("  {0,-42} = installed (exit {1})" -f 'TightVNC', $p.ExitCode) -ForegroundColor Green
+        Add-Result 'TightVNC install' "installed (exit $($p.ExitCode))" 'OK' $vncLog
+    } else {
+        Write-Host ("  {0,-42} = FAILED (exit {1})" -f 'TightVNC', $p.ExitCode) -ForegroundColor Red
+        Add-Result 'TightVNC install' "exit $($p.ExitCode)" 'FAILED' "see $vncLog"
+    }
+}
+
+
+# --- Default browser: Firefox ---
+# Windows protects each user's own default (the UserChoice value is hashed), so it is set
+# the supported way: a default associations file named by policy, which Windows applies to
+# every account at sign-in, plus the same file imported for new profiles. The ProgIds come
+# from what Firefox registered, so it only runs when Firefox is installed.
+try {
+    $ffReg = @((Get-ItemProperty 'HKLM:\SOFTWARE\RegisteredApplications' -ErrorAction Stop).PSObject.Properties | Where-Object { $_.Name -like 'Firefox*' }) | Select-Object -First 1
+    $ffUrl = $null; $ffHtml = $null
+    if ($ffReg) {
+        $ffCap  = 'HKLM:\' + $ffReg.Value
+        $ffUrl  = (Get-ItemProperty "$ffCap\URLAssociations"  -ErrorAction SilentlyContinue).http
+        $ffHtml = (Get-ItemProperty "$ffCap\FileAssociations" -ErrorAction SilentlyContinue).'.html'
+    }
+    if (-not $ffUrl -or -not $ffHtml) {
+        Write-Host ("  {0,-42} = Firefox not installed" -f 'Default browser') -ForegroundColor DarkGray
+        Add-Result 'Default browser' 'Firefox' 'SKIP' 'Firefox is not registered on this machine'
+    } else {
+        $assoc = @()
+        foreach ($p in 'http', 'https') { $assoc += "  <Association Identifier=`"$p`" ProgId=`"$ffUrl`" ApplicationName=`"Firefox`" />" }
+        foreach ($x in '.htm', '.html', '.shtml', '.xht', '.xhtml') { $assoc += "  <Association Identifier=`"$x`" ProgId=`"$ffHtml`" ApplicationName=`"Firefox`" />" }
+        $assocXml = "<?xml version=`"1.0`" encoding=`"UTF-8`"?>`r`n<DefaultAssociations>`r`n" + ($assoc -join "`r`n") + "`r`n</DefaultAssociations>`r`n"
+        $assocFile = Join-Path $env:ProgramData 'MTR-Setup\DefaultAssociations.xml'
+        $assocDir  = Split-Path $assocFile
+        if (-not (Test-Path $assocDir)) { New-Item -Path $assocDir -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+        $assocNow = if (Test-Path $assocFile) { [IO.File]::ReadAllText($assocFile) } else { $null }
+        if ($assocNow -cne $assocXml) { [IO.File]::WriteAllText($assocFile, $assocXml, (New-Object System.Text.UTF8Encoding($false))) }
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'DefaultAssociationsConfiguration' $assocFile 'String'
+        $dismOut = & dism.exe /Online /Import-DefaultAppAssociations:"$assocFile" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Add-Result 'Default browser' 'Firefox' 'OK' "http, https, .htm, .html set for every account at sign-in ($ffUrl)"
+            Write-Host ("  {0,-42} = Firefox (applies at sign-in)" -f 'Default browser')
+        } else {
+            Add-Result 'Default browser' 'Firefox' 'FAILED' "dism import returned $LASTEXITCODE - $((($dismOut | Where-Object { $_ }) -join ' ').Trim())"
+            Write-Host ("  {0,-42} = FAILED: dism returned {1}" -f 'Default browser', $LASTEXITCODE) -ForegroundColor Red
+        }
+        $script:DefaultBrowserSet = $true
+    }
+}
+catch {
+    Write-Host ("  {0,-42} = FAILED: {1}" -f 'Default browser', $_.Exception.Message) -ForegroundColor Red
+    Add-Result 'Default browser' 'Firefox' 'FAILED' $_.Exception.Message
+}
+
+# ---------------------------------------------------------------------------
+# 6. PERSONALIZATION > TASKBAR
+# ---------------------------------------------------------------------------
+# Runs after the installs so the pins step can find Firefox's Start menu shortcut.
+Write-Section 6 "Taskbar"
+
+# --- Items ---
 # Search: Hide   (0=Hide 1=Icon only 2=Search box 3=Icon+label)
 Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0
 Set-Reg $Advanced 'ShowTaskViewButton' 0      # Task view: Off
@@ -408,12 +1386,7 @@ catch {
     Add-Result 'Widgets (provisioned)' 'deprovision' 'FAILED' $_.Exception.Message
 }
 
-
-# ---------------------------------------------------------------------------
-# 3. PERSONALIZATION > TASKBAR - system tray icons
-# ---------------------------------------------------------------------------
-Write-Section 3 "System tray icons"
-
+# --- System tray icons ---
 Set-Reg 'HKCU:\Software\Microsoft\Input\Settings' 'EnableExpressiveInputShellHotkey' 0   # Emoji and more: Never
 Set-Reg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PenWorkspace' 'PenWorkspaceButtonDesiredVisibility' 0
 Set-Reg $Advanced 'TaskbarVirtualTouchpadVisibility' 0
@@ -429,12 +1402,7 @@ if (Test-Path $notify) {
     Add-Result 'Tray icons promoted' $icons.Count 'OK' (($icons.Name | Split-Path -Leaf) -join ', ')
 }
 
-
-# ---------------------------------------------------------------------------
-# 4. PERSONALIZATION > TASKBAR - behaviours
-# ---------------------------------------------------------------------------
-Write-Section 4 "Taskbar behaviours"
-
+# --- Behaviours ---
 Set-Reg $Advanced 'TaskbarAl'          0   # Alignment: Left
 Set-Reg $Advanced 'TaskbarBadges'      0   # Badges on taskbar apps
 Set-Reg $Advanced 'TaskbarFlashing'    0   # Flashing on taskbar apps
@@ -455,350 +1423,148 @@ if (Test-Path $stuck) {
     Add-Result 'Automatically hide the taskbar' 'off' 'OK' "$stuck (Settings byte 8, bit 0x01)"
 }
 
+# --- Pins ---
+# Only these, in this order, with every default pin cleared: File Explorer, the
+# MTR management console, Settings, Firefox, Yealink Room Connect (Yealink
+# hardware only) and Logitech Sync - the last three only if installed. Set with a
+# taskbar layout file plus the per-user "Start Layout" policy (User Configuration
+# > Administrative Templates > Start Menu and Taskbar), so it applies to the
+# account running this (Admin). The Apply step restarts Explorer, which applies it,
+# and it applies again at any sign-in after the file changes. A pin whose shortcut
+# is missing when it is applied is not shown.
+$pinEntries = @()
 
-# ---------------------------------------------------------------------------
-# 5. FILE EXPLORER
-# ---------------------------------------------------------------------------
-Write-Section 5 "File Explorer"
-
-Set-Reg $Advanced 'HideFileExt' 0   # show file name extensions
-
-
-# ---------------------------------------------------------------------------
-# 6. POWER
-# ---------------------------------------------------------------------------
-Write-Section 6 "Power"
-
-$scheme = [regex]::Match((powercfg /getactivescheme), '[0-9a-fA-F-]{36}').Value
-Write-Host "  Active scheme                              = $scheme"
-
-# /change applies to the live scheme immediately
-powercfg /change standby-timeout-ac   0
-powercfg /change standby-timeout-dc   0
-powercfg /change hibernate-timeout-ac 0
-powercfg /change hibernate-timeout-dc 0
-powercfg /change monitor-timeout-ac   $DisplayTimeoutMinutes
-powercfg /change monitor-timeout-dc   $DisplayTimeoutMinutes
-
-Write-Host "  Sleep / hibernate                          = never"
-Write-Host "  Display off after                          = $DisplayTimeoutMinutes min"
-Add-Result 'Sleep (standby)'   'never'                     'OK' "scheme $scheme"
-Add-Result 'Hibernate'         'never'                     'OK' "scheme $scheme"
-Add-Result 'Display off after' "$DisplayTimeoutMinutes min" 'OK' "scheme $scheme"
-
-Set-PowerValue $scheme 'USB selective suspend'      '2a737441-1930-4402-8d77-b2bebba308a3' '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' 0
-Set-PowerValue $scheme 'Hybrid sleep'               '238c9fa8-0aad-41ed-83f4-97be242c8f20' '94ac6d29-73ce-41a6-809f-6363ba21b47e' 0
-Set-PowerValue $scheme 'PCIe link state power mgmt' '501a4d13-42af-4429-9fd1-a8218c268e20' 'ee12f906-d277-404b-b6da-e5fa1a576df5' 0
-Set-PowerValue $scheme 'Unattended sleep timeout'   '238c9fa8-0aad-41ed-83f4-97be242c8f20' '7bc4a2f9-d8fc-4469-b07b-33eb785aaca0' 0
-
-# Required - without this the Set-PowerValue writes above never reach the
-# running system.
-& powercfg /setactive $scheme | Out-Null
-if ($LASTEXITCODE -eq 0) {
-    Write-Host "  Scheme re-activated                        = yes"
-    Add-Result 'Power scheme activated' 'yes' 'OK' $scheme
-} else {
-    Write-Host "  Scheme re-activated                        = FAILED" -ForegroundColor Red
-    Add-Result 'Power scheme activated' 'no' 'FAILED' "powercfg /setactive $scheme returned $LASTEXITCODE"
+function Add-PinApp {
+    param($Name, $Entry, $Detail)
+    $script:pinEntries += $Entry
+    Write-Host ("  {0,-42} = after Explorer restart" -f "Taskbar pin: $Name")
+    Add-Result "Taskbar pin: $Name" 'after Explorer restart' 'OK' $Detail
 }
 
-# Let the Tap's sensors wake the NUC. Not every NUC has both devices.
-foreach ($dev in @('HID Human Presence Sensor', 'HID-compliant touch screen')) {
-    $out = & powercfg /deviceenablewake $dev
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host ("  {0,-42} = wake enabled" -f $dev)
-        Add-Result "Wake: $dev" 'enabled' 'OK' ''
-    } else {
-        Write-Host ("  {0,-42} = not present" -f $dev) -ForegroundColor DarkGray
-        Add-Result "Wake: $dev" 'not present' 'SKIP' (($out | Where-Object { $_ }) -join ' ')
+function Add-PinShortcut {
+    param($Name, $LnkPath)
+    $p = $LnkPath.Replace($env:ALLUSERSPROFILE, '%ALLUSERSPROFILE%').Replace($env:APPDATA, '%APPDATA%').Replace($env:USERPROFILE, '%USERPROFILE%')
+    Add-PinApp $Name ('<taskbar:DesktopApp DesktopApplicationLinkPath="' + [Security.SecurityElement]::Escape($p) + '"/>') $LnkPath
+}
+
+# First top-level Start menu shortcut (all-users, then Admin) the filter accepts.
+$pinShell = New-Object -ComObject WScript.Shell
+function Find-StartMenuLink {
+    param([scriptblock]$Filter)
+    foreach ($programs in @((Join-Path $env:ALLUSERSPROFILE 'Microsoft\Windows\Start Menu\Programs'), (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs'))) {
+        $hit = Get-ChildItem -Path $programs -Filter '*.lnk' -Recurse -ErrorAction SilentlyContinue | Where-Object {
+            $sc = $pinShell.CreateShortcut($_.FullName)
+            & $Filter $_ $sc
+        } | Select-Object -First 1
+        if ($hit) { return $hit }
     }
-}
-
-# Stop Windows powering down USB devices - keeps the Tap, camera and mic on the bus
-try {
-    $powerMgmt = @(Get-CimInstance -ClassName MSPower_DeviceEnable -Namespace root/WMI -ErrorAction Stop)
-    $usbDevs   = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter 'PNPClass = "USB"' -ErrorAction Stop)
-    $targets   = @($usbDevs | ForEach-Object {
-                     $id = $_.PNPDeviceID
-                     $powerMgmt | Where-Object InstanceName -Like "*$id*"
-                  })
-    if ($targets.Count) {
-        $targets | Set-CimInstance -Property @{ Enable = $false } -ErrorAction Stop
-    }
-    Write-Host "  USB power saving disabled on               = $($targets.Count) device(s)"
-    Add-Result 'USB power saving' "disabled on $($targets.Count)" 'OK' "$($usbDevs.Count) USB devices enumerated"
-}
-catch {
-    Write-Host "  USB power saving                           = FAILED: $($_.Exception.Message)" -ForegroundColor Red
-    Add-Result 'USB power saving' 'disable' 'FAILED' $_.Exception.Message
-}
-
-Set-Reg 'HKLM:\System\CurrentControlSet\Control\Power' 'PlatformAoAcOverride' 0   # disable Modern Standby
-
-
-# ---------------------------------------------------------------------------
-# 7. SHORTCUTS AND FOLDER STRUCTURE
-# ---------------------------------------------------------------------------
-Write-Section 7 "Shortcuts and Folder Structure"
-
-# Resolve the real Downloads path (survives folder redirection)
-$dlKey  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
-$dlGuid = '{374DE290-123F-4565-9164-39C4925E467B}'
-$downloads = (Get-ItemProperty -Path $dlKey -Name $dlGuid -ErrorAction SilentlyContinue).$dlGuid
-if ($downloads) { $downloads = [Environment]::ExpandEnvironmentVariables($downloads) }
-else            { $downloads = Join-Path $env:USERPROFILE 'Downloads' }
-Write-Host "  Downloads  = $downloads"
-
-$workDir = Join-Path $downloads $TempFolderName
-New-Item -Path $workDir -ItemType Directory -Force | Out-Null
-Write-Host "  created    = $workDir"
-Add-Result 'Temp folder' $TempFolderName 'OK' $workDir
-
-# Stash the share credential so the shortcut opens without a prompt
-cmdkey /delete:$ShareHost 2>&1 | Out-Null
-cmdkey /add:$ShareHost /user:"$ShareHost\$ShareUser" /pass:"$SharePass" | Out-Null
-Write-Host "  credential = $ShareHost\$ShareUser  (stored for $env:USERNAME)"
-Add-Result 'Stored credential' "$ShareHost\$ShareUser" 'OK' "for $env:USERNAME"
-
-$lnkTarget = "\\$ShareHost\$SoftwareShare"
-$lnkPath   = Join-Path $workDir "$SoftwareShare on $ShareHost.lnk"
-$wsh = New-Object -ComObject WScript.Shell
-$lnk = $wsh.CreateShortcut($lnkPath)
-$lnk.TargetPath  = $lnkTarget
-$lnk.Description = "Software share - $lnkTarget"
-$lnk.Save()
-Write-Host "  shortcut   = $lnkPath  ->  $lnkTarget"
-Add-Result 'Shortcut' ([IO.Path]::GetFileName($lnkPath)) 'OK' "$lnkPath -> $lnkTarget"
-
-# Points at the network copy (not the C:\Scripts staged copy) so re-running
-# it always picks up whatever this script currently does.
-$setupLnkPath = Join-Path $workDir 'run-mtr_setup.bat - Shortcut.lnk'
-$setupLnk = $wsh.CreateShortcut($setupLnkPath)
-$setupLnk.TargetPath  = $SetupBat
-$setupLnk.Description = "Re-run MTR setup - $SetupBat"
-$setupLnk.Save()
-Write-Host "  shortcut   = $setupLnkPath  ->  $SetupBat"
-Add-Result 'Shortcut' ([IO.Path]::GetFileName($setupLnkPath)) 'OK' "$setupLnkPath -> $SetupBat"
-
-# Root of the share, on the Desktop rather than in _mtrsetup - meant to be
-# visible without digging through Downloads.
-$desktop         = [Environment]::GetFolderPath('Desktop')
-$shareRootTarget = "\\$ShareHost"
-$shareRootLnkPath = Join-Path $desktop "$ShareHost share.lnk"
-$shareRootLnk = $wsh.CreateShortcut($shareRootLnkPath)
-$shareRootLnk.TargetPath  = $shareRootTarget
-$shareRootLnk.Description = "MTR share - $shareRootTarget"
-$shareRootLnk.Save()
-Write-Host "  shortcut   = $shareRootLnkPath  ->  $shareRootTarget"
-Add-Result 'Shortcut' ([IO.Path]::GetFileName($shareRootLnkPath)) 'OK' "$shareRootLnkPath -> $shareRootTarget"
-
-
-# ---------------------------------------------------------------------------
-# 8. SOFTWARE INSTALLS
-# ---------------------------------------------------------------------------
-Write-Section 8 "Software installs"
-
-$softwareFolder = Join-Path $workDir $SoftwareShare
-New-Item -Path $softwareFolder -ItemType Directory -Force | Out-Null
-Write-Host "  created    = $softwareFolder"
-Add-Result 'Software folder' $SoftwareShare 'OK' $softwareFolder
-
-# Extron Teams MTR app - copied down and extracted into the Software folder
-$zipName      = [IO.Path]::GetFileName($ExtronMtrZip)
-$zipShareRoot = ($ExtronMtrZip -split '\\')[0..3] -join '\'     # -> \\host\share
-net use $zipShareRoot /user:"$ShareHost\$ShareUser" "$SharePass" 2>&1 | Out-Null
-
-if (Test-Path $ExtronMtrZip) {
-    Copy-Item -Path $ExtronMtrZip -Destination $softwareFolder -Force
-    Write-Host "  copied $zipName -> $softwareFolder" -ForegroundColor Green
-    Add-Result 'Extron Teams MTR zip' $zipName 'OK' "$ExtronMtrZip -> $softwareFolder"
-
-    $zipLocal    = Join-Path $softwareFolder $zipName
-    $extractTemp = Join-Path $softwareFolder '_extract_tmp'
-    try {
-        Expand-Archive -Path $zipLocal -DestinationPath $extractTemp -Force -ErrorAction Stop
-        # .msi (not .exe) - it's a plain Windows Installer package, so it
-        # can be driven silently via msiexec rather than the double-click
-        # .exe wrapper. See "Installer Read Me.txt" inside the zip.
-        $msi = Get-ChildItem -Path $extractTemp -Filter '*.msi' -Recurse -File | Select-Object -First 1
-        if ($msi) {
-            # Copied under a fixed name, not the zip's versioned filename
-            # (e.g. "..._v2x5x1.msi") - Windows Installer caches the exact
-            # source filename a product was installed from, and a repair
-            # later resolves against that cached name. A mismatch there
-            # fails with "SecureRepair Failed" / ProcessComponents return 3
-            # (surfaces as msiexec exit 1603), confirmed on a test MTR.
-            $msi = Copy-Item -Path $msi.FullName -Destination (Join-Path $softwareFolder $ExtronMsiName) -Force -PassThru
-            Write-Host ("  extracted  = {0} -> {1}" -f $msi.Name, $softwareFolder) -ForegroundColor Green
-            Add-Result 'Extron Teams MTR extract' $msi.Name 'OK' $msi.FullName
-
-            Remove-Item -Path $zipLocal -Force -ErrorAction SilentlyContinue
-            Write-Host "  removed    = $zipLocal"
-        } else {
-            Write-Host "  extract FAILED: no .msi found in $zipName" -ForegroundColor Red
-            Add-Result 'Extron Teams MTR extract' $zipName 'FAILED' 'no .msi found inside the archive'
-        }
-    }
-    catch {
-        Write-Host "  extract FAILED: $($_.Exception.Message)" -ForegroundColor Red
-        Add-Result 'Extron Teams MTR extract' $zipName 'FAILED' $_.Exception.Message
-    }
-    finally {
-        Remove-Item -Path $extractTemp -Recurse -Force -ErrorAction SilentlyContinue
-    }
-} else {
-    Write-Warning "Source not reachable: $ExtronMtrZip"
-    Add-Result 'Extron Teams MTR zip' $zipName 'FAILED' "source not reachable: $ExtronMtrZip"
-}
-
-# Logitech Sync installer - straight copy, no extraction needed
-$logiName = [IO.Path]::GetFileName($LogiSyncExe)
-if (Test-Path $LogiSyncExe) {
-    Copy-Item -Path $LogiSyncExe -Destination $softwareFolder -Force
-    Write-Host "  copied $logiName -> $softwareFolder" -ForegroundColor Green
-    Add-Result 'Logitech Sync installer' $logiName 'OK' "$LogiSyncExe -> $softwareFolder"
-} else {
-    Write-Warning "Source not reachable: $LogiSyncExe"
-    Add-Result 'Logitech Sync installer' $logiName 'FAILED' "source not reachable: $LogiSyncExe"
-}
-
-net use $zipShareRoot /delete 2>&1 | Out-Null
-
-# Install whichever of the two isn't already on the machine. Extron runs
-# silently via msiexec; LogiSync has no documented silent switch so it's
-# launched interactively. Both use -Wait so the end-of-script logoff
-# doesn't cut an install (or the tech's wizard) off mid-way.
-function Test-AppInstalled {
-    param([string]$NameLike)
-    $uninstallPaths = @(
-        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
-    )
-    Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -like $NameLike } |
-        Select-Object -First 1
-}
-
-# Reads a summary property straight out of the MSI's own database, rather
-# than trusting the zip's filename.
-function Get-MsiProperty {
-    param([string]$Path, [string]$Property)
-    try {
-        $installer = New-Object -ComObject WindowsInstaller.Installer
-        $db     = $installer.OpenDatabase($Path, 0)
-        $view   = $db.OpenView("SELECT Value FROM Property WHERE Property = '$Property'")
-        [void]$view.Execute()
-        $record = $view.Fetch()
-        if ($record) { return $record.StringData(1).Trim() }
-    }
-    catch { }
     return $null
 }
 
-if ($msi) {
-    $msiPath        = Join-Path $softwareFolder $msi.Name
-    $msiLog         = Join-Path $softwareFolder 'ExtronInstall.log'
-    $packageVersion = Get-MsiProperty $msiPath 'ProductVersion'
-    $productCode    = Get-MsiProperty $msiPath 'ProductCode'
+Add-PinApp 'File Explorer' '<taskbar:DesktopApp DesktopApplicationID="Microsoft.Windows.Explorer"/>' 'Microsoft.Windows.Explorer'
 
-    # Ask Windows Installer directly whether this exact ProductCode is
-    # registered, rather than pattern-matching the Uninstall registry's
-    # DisplayName - that missed a real install on a test MTR whose DisplayName
-    # didn't match '*Extron Control*', and disagreeing with Windows Installer
-    # here is exactly what leads to msiexec refusing with 1638 below.
-    $installedVersion = $null
-    $productState     = $null
-    $productStateErr  = $null
-    if ($productCode) {
-        try {
-            $installerCom = New-Object -ComObject WindowsInstaller.Installer
-            $productState = $installerCom.ProductState($productCode)
-            if ($productState -eq 5) {
-                $installedVersion = $installerCom.ProductInfo($productCode, 'VersionString')
-            }
-        }
-        catch { $productStateErr = $_.Exception.Message }
+if ($mmcLnkPath -and (Test-Path $mmcLnkPath)) {
+    Add-PinShortcut 'MTR console' $mmcLnkPath
+} else {
+    Write-Host ("  {0,-42} = no shortcut" -f 'Taskbar pin: MTR console')
+    Add-Result 'Taskbar pin: MTR console' 'no shortcut' 'SKIP' 'MMC Desktop shortcut was not created'
+}
+
+Add-PinApp 'Settings' '<taskbar:UWA AppUserModelID="windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"/>' 'windows.immersivecontrolpanel'
+
+$firefoxLink = Find-StartMenuLink { param($file, $sc) $sc.TargetPath -like '*\firefox.exe' -and -not $sc.Arguments }
+if ($firefoxLink) { Add-PinShortcut 'Firefox' $firefoxLink.FullName }
+else {
+    Write-Host ("  {0,-42} = not installed" -f 'Taskbar pin: Firefox')
+    Add-Result 'Taskbar pin: Firefox' 'not installed' 'SKIP' 'no Firefox Start menu shortcut found'
+}
+
+if ($maker -like '*Yealink*') {
+    $rcExe  = Join-Path $env:ProgramFiles 'Yealink Room Connect\bin\Yealink Room Connect.exe'
+    $rcLink = Find-StartMenuLink { param($file, $sc) $sc.TargetPath -eq $rcExe }
+    if (-not $rcLink -and (Test-Path -LiteralPath $rcExe)) {
+        # Installed but no Start menu shortcut: make one so there is a .lnk to pin.
+        $rcPath = Join-Path $env:ALLUSERSPROFILE 'Microsoft\Windows\Start Menu\Programs\Yealink Room Connect.lnk'
+        $rcSc = $pinShell.CreateShortcut($rcPath)
+        $rcSc.TargetPath = $rcExe
+        $rcSc.WorkingDirectory = Split-Path $rcExe
+        $rcSc.Save()
+        $rcLink = Get-Item -LiteralPath $rcPath
     }
-    if ($Debug) {
-        Write-Host ("  [diag] ProductCode={0} ProductState={1} InstalledVersion={2} Error={3}" -f `
-            $productCode, $productState, $installedVersion, $productStateErr) -ForegroundColor DarkGray
-    }
-
-    # Windows Installer's own version comparisons only honour the first three
-    # fields (Major.Minor.Build) of ProductVersion - a 4th field is legal but
-    # ignored for product-identity purposes. Truncate both sides the same way
-    # before comparing, or a package whose metadata carries a 4th field (e.g.
-    # 2.5.1.1) reads as "newer" than an installed 2.5.1 that MSI itself
-    # considers identical - which is what led to the same install being
-    # attempted twice on a test MTR (1638, then 1603 on the forced repair).
-    function ConvertTo-MsiVersion {
-        param([string]$VersionString)
-        if (-not $VersionString) { return $null }
-        $parts = @($VersionString -split '\.')[0..2]
-        return [version]($parts -join '.')
-    }
-
-    # Only treat it as up to date if both versions actually parsed and the
-    # installed one is not older - anything else (not installed, older, or
-    # version unreadable either side) falls through to installing/upgrading.
-    $upToDate = $false
-    if ($installedVersion -and $packageVersion) {
-        try { $upToDate = (ConvertTo-MsiVersion $installedVersion) -ge (ConvertTo-MsiVersion $packageVersion) }
-        catch { $upToDate = $false }
-    }
-
-    if ($upToDate) {
-        Write-Host ("  {0,-42} = already installed ({1})" -f 'Extron Control', $installedVersion)
-        Add-Result 'Extron Control install' "already installed ($installedVersion)" 'OK' $installedVersion
-    } else {
-        $action = if ($installedVersion) { "upgrading $installedVersion -> $packageVersion" } else { "installing $packageVersion" }
-        Write-Host ("  {0,-42} = {1}" -f 'Extron Control', $action) -ForegroundColor Yellow
-        $msiArgs = @('/i', "`"$msiPath`"", '/qn', '/norestart', '/l*v', "`"$msiLog`"")
-        $p = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-
-        if ($p.ExitCode -eq 1638) {
-            # ERROR_PRODUCT_VERSION - a build already on the machine shares this package's
-            # ProductCode, so plain /i refuses it outright. /f (repair) is what MSI expects
-            # to bring a same-ProductCode install forward to a different package's version.
-            Write-Host ("  {0,-42} = same product code installed, repairing to {1}" -f 'Extron Control', $packageVersion) -ForegroundColor Yellow
-            $repairArgs = @('/fvomus', "`"$msiPath`"", '/qn', '/norestart', '/l*v', "`"$msiLog`"")
-            $p = Start-Process msiexec.exe -ArgumentList $repairArgs -Wait -PassThru
-        }
-
-        if ($p.ExitCode -in 0, 3010) {
-            Write-Host ("  {0,-42} = installed (exit {1})" -f 'Extron Control', $p.ExitCode) -ForegroundColor Green
-            Add-Result 'Extron Control install' "$action (exit $($p.ExitCode))" 'OK' $msiLog
-        } else {
-            Write-Host ("  {0,-42} = FAILED (exit {1})" -f 'Extron Control', $p.ExitCode) -ForegroundColor Red
-            Add-Result 'Extron Control install' "exit $($p.ExitCode)" 'FAILED' "see $msiLog"
-        }
+    if ($rcLink) { Add-PinShortcut 'Yealink Room Connect' $rcLink.FullName }
+    else {
+        Write-Host ("  {0,-42} = not installed" -f 'Taskbar pin: Yealink Room Connect')
+        Add-Result 'Taskbar pin: Yealink Room Connect' 'not installed' 'SKIP' "not found: $rcExe"
     }
 }
 
-if (Test-Path (Join-Path $softwareFolder $logiName)) {
-    $logiInstalled = Test-AppInstalled '*Logitech Sync*'
-    if ($logiInstalled) {
-        $ver = if ($logiInstalled.DisplayVersion) { " ($($logiInstalled.DisplayVersion))" } else { '' }
-        Write-Host ("  {0,-42} = already installed{1}" -f 'Logitech Sync', $ver)
-        Add-Result 'Logitech Sync install' "already installed$ver" 'OK' $logiInstalled.DisplayVersion
+$syncExe  = Join-Path ${env:ProgramFiles(x86)} 'Logitech\LogiSync\frontend\Sync.exe'
+$syncLink = Find-StartMenuLink { param($file, $sc) $sc.TargetPath -eq $syncExe }
+if (-not $syncLink -and (Test-Path -LiteralPath $syncExe)) {
+    # Installed but no Start menu shortcut: make one so there is a .lnk to pin.
+    $syncPath = Join-Path $env:ALLUSERSPROFILE 'Microsoft\Windows\Start Menu\Programs\Logi Sync.lnk'
+    $syncSc = $pinShell.CreateShortcut($syncPath)
+    $syncSc.TargetPath = $syncExe
+    $syncSc.WorkingDirectory = Split-Path $syncExe
+    $syncSc.Save()
+    $syncLink = Get-Item -LiteralPath $syncPath
+}
+if ($syncLink) { Add-PinShortcut 'Logitech Sync' $syncLink.FullName }
+else {
+    Write-Host ("  {0,-42} = not installed" -f 'Taskbar pin: Logitech Sync')
+    Add-Result 'Taskbar pin: Logitech Sync' 'not installed' 'SKIP' "not found: $syncExe"
+}
+$layoutXml = @"
+<?xml version="1.0" encoding="utf-8"?>
+<LayoutModificationTemplate
+    xmlns="http://schemas.microsoft.com/Start/2014/LayoutModification"
+    xmlns:defaultlayout="http://schemas.microsoft.com/Start/2014/FullDefaultLayout"
+    xmlns:start="http://schemas.microsoft.com/Start/2014/StartLayout"
+    xmlns:taskbar="http://schemas.microsoft.com/Start/2014/TaskbarLayout"
+    Version="1">
+  <CustomTaskbarLayoutCollection PinListPlacement="Replace">
+    <defaultlayout:TaskbarLayout>
+      <taskbar:TaskbarPinList>
+        $($pinEntries -join "`r`n        ")
+      </taskbar:TaskbarPinList>
+    </defaultlayout:TaskbarLayout>
+  </CustomTaskbarLayoutCollection>
+</LayoutModificationTemplate>
+"@
+
+# Left untouched when the content is unchanged, so a re-run does not make the
+# file look newer and re-apply the pins at the next Explorer start.
+$layoutFile = Join-Path $env:ProgramData 'MTR-Setup\TaskbarLayout.xml'
+try {
+    $layoutDir = Split-Path $layoutFile
+    if (-not (Test-Path $layoutDir)) { New-Item -Path $layoutDir -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+    $current = if (Test-Path $layoutFile) { [IO.File]::ReadAllText($layoutFile) } else { $null }
+    if ($current -ceq $layoutXml) {
+        Write-Host ("  {0,-42} = unchanged" -f 'Taskbar layout file')
+        Add-Result 'Taskbar layout file' 'unchanged' 'OK' $layoutFile
     } else {
-        Write-Host ("  {0,-42} = launching installer" -f 'Logitech Sync') -ForegroundColor Yellow
-        Start-Process -FilePath (Join-Path $softwareFolder $logiName) -Wait
-        Add-Result 'Logitech Sync install' 'launched installer' 'OK' $logiName
+        [IO.File]::WriteAllText($layoutFile, $layoutXml, (New-Object System.Text.UTF8Encoding($true)))
+        Write-Host ("  {0,-42} = written" -f 'Taskbar layout file')
+        Add-Result 'Taskbar layout file' 'written' 'OK' $layoutFile
     }
+
+    $explorerPolicy = 'HKCU:\Software\Policies\Microsoft\Windows\Explorer'
+    Set-Reg $explorerPolicy 'StartLayoutFile'   $layoutFile 'ExpandString'
+    Set-Reg $explorerPolicy 'LockedStartLayout' 1
+    $script:TaskbarPinsSet = $true
+}
+catch {
+    Write-Host ("  {0,-42} = FAILED: {1}" -f 'Taskbar layout file', $_.Exception.Message) -ForegroundColor Red
+    Add-Result 'Taskbar layout file' 'write' 'FAILED' $_.Exception.Message
 }
 
 
 # ---------------------------------------------------------------------------
-# 9. APPEARANCE - wallpaper and colours
+# 7. APPEARANCE - wallpaper and colours
 # ---------------------------------------------------------------------------
 # Applies to the Windows desktop for the account running this (Admin).
 # The MTR console theme is separate and untouched.
-Write-Section 9 "Appearance"
-
-$shareRoot = ($SourceFile -split '\\')[0..3] -join '\'     # -> \\host\share
-net use $shareRoot /user:"$ShareHost\$ShareUser" "$SharePass" 2>&1 | Out-Null
+Write-Section 7 "Appearance"
 
 $imgName = [IO.Path]::GetFileName($SourceFile)
 if (Test-Path $SourceFile) {
@@ -806,11 +1572,9 @@ if (Test-Path $SourceFile) {
     Write-Host "  copied $imgName -> $workDir" -ForegroundColor Green
     Add-Result 'Background image' $imgName 'OK' "$SourceFile -> $workDir"
 } else {
-    Write-Warning "Source not reachable: $SourceFile"
-    Add-Result 'Background image' $imgName 'FAILED' "source not reachable: $SourceFile"
+    Write-Warning "Not found on the share: $SourceFile"
+    Add-Result 'Background image' $imgName 'FAILED' "not found: $SourceFile"
 }
-
-net use $shareRoot /delete 2>&1 | Out-Null
 
 # Point at the local copy - the share is unmounted by now and the wallpaper
 # path has to stay resolvable at every future logon.
@@ -851,9 +1615,9 @@ Set-Reg 'HKCU:\Control Panel\Desktop' 'AutoColorization' 1   # Accent colour: Au
 
 
 # ---------------------------------------------------------------------------
-# 10. REMOTE MANAGEMENT (WinRM / PS Remoting)
+# 8. REMOTE MANAGEMENT (WinRM / PS Remoting)
 # ---------------------------------------------------------------------------
-Write-Section 10 "Remote management (WinRM)"
+Write-Section 8 "Remote management (WinRM)"
 
 # Enable-PSRemoting's firewall rule only opens on Domain/Private profiles.
 # These are workgroup machines, so the LAN NIC can default to Public, and
@@ -866,7 +1630,7 @@ try {
     foreach ($p in $publicProfiles) {
         Set-NetConnectionProfile -InterfaceIndex $p.InterfaceIndex -NetworkCategory Private
         Write-Host ("  {0,-42} = Public -> Private" -f $p.InterfaceAlias)
-        Add-Result 'Network category' 'Private' 'OK' "$($p.InterfaceAlias) was Public"
+        Add-Result "Network category: $($p.InterfaceAlias)" 'Public -> Private' 'OK' "InterfaceIndex $($p.InterfaceIndex)"
     }
     if (-not $publicProfiles.Count) {
         Write-Host "  Network category                           = already Private/Domain"
@@ -909,21 +1673,99 @@ catch {
     Add-Result 'ICMP (ping)' 'enable' 'FAILED' $_.Exception.Message
 }
 
-# TightVNC: "Hide desktop wallpaper" (Server tab, Miscellaneous) must stay
-# unchecked - RemoveWallpaper=0. 32-bit and 64-bit TightVNC builds read this
-# from different registry views, so write both; whichever doesn't apply is
-# simply unused. Takes effect on the next VNC connection, not the current one.
-Set-Reg 'HKLM:\SOFTWARE\TightVNC\Server' 'RemoveWallpaper' 0
-Set-Reg 'HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server' 'RemoveWallpaper' 0
+# TightVNC server settings the fleet wants off, both on the Server tab:
+#   RemoveWallpaper=0        "Hide desktop wallpaper" unticked
+#   AcceptHttpConnections=0  "Serve Java Viewer to Web clients" unticked
+# A fresh install already gets both from the install properties; this covers a
+# TightVNC that was already there. The service keeps its settings in memory
+# (that is what the Configuration window shows), so a registry change only shows
+# once the service restarts - restart it, but only when a value actually had to
+# change, so a run never drops a VNC session needlessly. A 64-bit build uses the
+# native registry view, a 32-bit build the WOW6432Node one; use whichever exists.
+$vncSettings = [ordered]@{ RemoveWallpaper = 0; AcceptHttpConnections = 0 }
+$vncSvc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq 'tvnserver' -or $_.DisplayName -like 'TightVNC*' } | Select-Object -First 1
+if (-not $vncSvc) {
+    Write-Host ("  {0,-42} = TightVNC not installed, nothing to set" -f 'TightVNC settings')
+    Add-Result 'TightVNC settings' 'TightVNC not installed' 'SKIP' 'nothing to set'
+}
+else {
+    $vncKey = @('HKLM:\SOFTWARE\TightVNC\Server', 'HKLM:\SOFTWARE\WOW6432Node\TightVNC\Server') | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $vncKey) { $vncKey = 'HKLM:\SOFTWARE\TightVNC\Server' }
+    $vncChanged = $false
+    foreach ($name in $vncSettings.Keys) {
+        $was = (Get-ItemProperty -Path $vncKey -Name $name -ErrorAction SilentlyContinue).$name
+        if ($was -ne $vncSettings[$name]) { $vncChanged = $true }
+        Set-Reg $vncKey $name $vncSettings[$name]
+    }
+    if ($vncChanged -and $vncSvc.Status -eq 'Running') {
+        try {
+            Restart-Service -Name $vncSvc.Name -Force -ErrorAction Stop
+            Write-Host ("  {0,-42} = restarted to load the settings" -f 'TightVNC service') -ForegroundColor Green
+            Add-Result 'TightVNC service' 'restarted' 'OK' 'to load the changed settings'
+        }
+        catch {
+            Write-Host ("  {0,-42} = FAILED to restart: {1}" -f 'TightVNC service', $_.Exception.Message) -ForegroundColor Red
+            Add-Result 'TightVNC service' 'restart' 'FAILED' $_.Exception.Message
+        }
+    }
+}
 
 
 # ---------------------------------------------------------------------------
-# 11. CLEANUP
+# 9. CLEANUP
 # ---------------------------------------------------------------------------
-# Unwanted software found on the fleet gets removed here. One entry so far;
+# Unwanted software found on the fleet gets removed here. TeamViewer and some Store apps so far;
 # add more the same way as they turn up.
-Write-Section 11 "Cleanup"
+Write-Section 9 "Cleanup"
 
+# Store apps - Xbox (and its helper packages), WhatsApp, Solitaire and LinkedIn.
+# Deprovisioned first, then removed for all users, so a new profile does not get them back.
+# A package Windows marks non-removable is recorded SKIP rather than FAILED.
+$storeApps = [ordered]@{
+    'Xbox'      = @('Microsoft.GamingApp', 'Microsoft.Xbox*')
+    'WhatsApp'  = @('*WhatsApp*')
+    'Solitaire' = @('Microsoft.MicrosoftSolitaireCollection')
+    'LinkedIn'  = @('*LinkedIn*')
+}
+$provisioned = @()
+try { $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop) } catch { }
+foreach ($app in $storeApps.Keys) {
+    $found = 0
+    foreach ($pattern in $storeApps[$app]) {
+        foreach ($p in @($provisioned | Where-Object { $_.DisplayName -like $pattern })) {
+            try {
+                Remove-AppxProvisionedPackage -Online -PackageName $p.PackageName -ErrorAction Stop | Out-Null
+                Add-Result "$app (provisioned)" $p.DisplayName 'OK' 'deprovisioned'
+            }
+            catch {
+                Add-Result "$app (provisioned)" $p.DisplayName 'FAILED' $_.Exception.Message
+            }
+        }
+        $pkgs = @()
+        try { $pkgs = @(Get-AppxPackage -AllUsers -Name $pattern -ErrorAction Stop) } catch { }
+        foreach ($pkg in $pkgs) {
+            $found++
+            if ($pkg.NonRemovable) {
+                Write-Host ("  {0,-42} = skipped (non-removable)" -f "$app ($($pkg.Name))") -ForegroundColor DarkGray
+                Add-Result "$app app" $pkg.Name 'SKIP' 'package is marked non-removable'
+                continue
+            }
+            try {
+                Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                Write-Host ("  {0,-42} = removed" -f "$app ($($pkg.Name))") -ForegroundColor Green
+                Add-Result "$app app" $pkg.Name 'OK' "removed $($pkg.PackageFullName)"
+            }
+            catch {
+                Write-Host ("  {0,-42} = FAILED: {1}" -f "$app ($($pkg.Name))", $_.Exception.Message) -ForegroundColor Red
+                Add-Result "$app app" $pkg.Name 'FAILED' "$($pkg.PackageFullName) - $($_.Exception.Message)"
+            }
+        }
+    }
+    if (-not $found) {
+        Write-Host ("  {0,-42} = not installed" -f "$app app")
+        Add-Result "$app app" 'not installed' 'OK' 'nothing to remove'
+    }
+}
 # TeamViewer - unmanaged remote-access tool, redundant now that WinRM and
 # VNC are the sanctioned remote paths. Some builds register more than one
 # Uninstall entry (e.g. a 32-bit view alongside the native one).
@@ -976,9 +1818,376 @@ catch {
 
 
 # ---------------------------------------------------------------------------
-# 12. REPORT
+# 10. AUDIO
 # ---------------------------------------------------------------------------
-Write-Host "`n[12] Writing report" -ForegroundColor Cyan
+# Same as doing it by hand in mmsys.cpl: the Echo Cancelling Speakerphone
+# (a QSYS DSP, Extron DSP USB interface or Logitech Rally System, whatever the room
+# has) is the only output, renamed Room Audio Output, volume 60 and the default
+# playback device. The inputs are cut down to that device (renamed Room Mics, volume 100,
+# default communications device) and the content capture input (volume 100, default
+# device). Endpoint state, names and volume are machine-wide; the default devices
+# are per user, so they are set for the account running this (Admin).
+# Nothing is changed when no Echo Cancelling Speakerphone is found, so a room is
+# never left with no audio. The Windows audio API has no cmdlets for this, hence the
+# small interop class.
+Write-Section 10 "Audio"
+
+$audioSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public class MtrAudioEndpoint
+{
+    public string Id;
+    public string Flow;
+    public int State;
+    public string FriendlyName;
+    public string Desc;
+    public string Adapter;
+}
+
+public static class MtrAudio
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct PropertyKey { public Guid fmtid; public int pid; }
+
+    [StructLayout(LayoutKind.Explicit)]
+    struct PropVariant
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr p1;
+        [FieldOffset(16)] public IntPtr p2;
+    }
+
+    [DllImport("ole32.dll")]
+    static extern int PropVariantClear(ref PropVariant pv);
+
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore
+    {
+        [PreserveSig] int GetCount(out uint count);
+        [PreserveSig] int GetAt(uint index, out PropertyKey key);
+        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+        [PreserveSig] int Commit();
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice
+    {
+        [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+        [PreserveSig] int OpenPropertyStore(int access, out IPropertyStore store);
+        [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        [PreserveSig] int GetState(out int state);
+    }
+
+    [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceCollection
+    {
+        [PreserveSig] int GetCount(out uint count);
+        [PreserveSig] int Item(uint index, out IMMDevice device);
+    }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator
+    {
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
+        [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+    }
+
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumeratorClass { }
+
+    [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioEndpointVolume
+    {
+        [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int GetChannelCount(out uint count);
+        [PreserveSig] int SetMasterVolumeLevel(float levelDb, ref Guid eventContext);
+        [PreserveSig] int SetMasterVolumeLevelScalar(float level, ref Guid eventContext);
+        [PreserveSig] int GetMasterVolumeLevel(out float levelDb);
+        [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+    }
+
+    [ComImport, Guid("F8679F50-850A-41CF-9C72-430F290290C8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPolicyConfig
+    {
+        [PreserveSig] int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr format);
+        [PreserveSig] int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string name, int isDefault, IntPtr format);
+        [PreserveSig] int ResetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string name);
+        [PreserveSig] int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr endpointFormat, IntPtr mixFormat);
+        [PreserveSig] int GetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string name, int isDefault, IntPtr defaultPeriod, IntPtr minimumPeriod);
+        [PreserveSig] int SetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr period);
+        [PreserveSig] int GetShareMode([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr mode);
+        [PreserveSig] int SetShareMode([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr mode);
+        [PreserveSig] int GetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string name, int fx, ref PropertyKey key, IntPtr value);
+        [PreserveSig] int SetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string name, int fx, ref PropertyKey key, IntPtr value);
+        [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string name, int role);
+        [PreserveSig] int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string name, int visible);
+    }
+
+    [ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")]
+    class PolicyConfigClientClass { }
+
+    static readonly Guid FmtDevice = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0");
+    static readonly Guid FmtInterface = new Guid("b3f8fa53-0004-438e-9003-51a46e139bfc");
+    static readonly Guid IidEndpointVolume = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
+
+    static string ReadString(IPropertyStore store, Guid fmtid, int pid)
+    {
+        PropertyKey key = new PropertyKey();
+        key.fmtid = fmtid;
+        key.pid = pid;
+        PropVariant v;
+        if (store.GetValue(ref key, out v) != 0) return "";
+        string s = (v.vt == 31 && v.p1 != IntPtr.Zero) ? Marshal.PtrToStringUni(v.p1) : "";
+        PropVariantClear(ref v);
+        return s;
+    }
+
+    static IMMDevice Open(string id)
+    {
+        IMMDeviceEnumerator en = (IMMDeviceEnumerator)new MMDeviceEnumeratorClass();
+        IMMDevice dev;
+        int hr = en.GetDevice(id, out dev);
+        if (hr != 0) throw new COMException("GetDevice", hr);
+        return dev;
+    }
+
+    // Active, disabled and unplugged endpoints of one flow (0 = playback, 1 = recording).
+    public static List<MtrAudioEndpoint> GetEndpoints(int flow)
+    {
+        List<MtrAudioEndpoint> list = new List<MtrAudioEndpoint>();
+        IMMDeviceEnumerator en = (IMMDeviceEnumerator)new MMDeviceEnumeratorClass();
+        IMMDeviceCollection col;
+        int hr = en.EnumAudioEndpoints(flow, 11, out col);
+        if (hr != 0) throw new COMException("EnumAudioEndpoints", hr);
+        uint count;
+        col.GetCount(out count);
+        for (uint i = 0; i < count; i++)
+        {
+            IMMDevice dev;
+            if (col.Item(i, out dev) != 0) continue;
+            MtrAudioEndpoint ep = new MtrAudioEndpoint();
+            dev.GetId(out ep.Id);
+            dev.GetState(out ep.State);
+            ep.Flow = flow == 0 ? "Render" : "Capture";
+            IPropertyStore store;
+            if (dev.OpenPropertyStore(0, out store) == 0)
+            {
+                ep.FriendlyName = ReadString(store, FmtDevice, 14);
+                ep.Desc = ReadString(store, FmtDevice, 2);
+                ep.Adapter = ReadString(store, FmtInterface, 6);
+            }
+            list.Add(ep);
+        }
+        return list;
+    }
+
+    public static int SetVisible(string id, bool visible)
+    {
+        IPolicyConfig pc = (IPolicyConfig)new PolicyConfigClientClass();
+        return pc.SetEndpointVisibility(id, visible ? 1 : 0);
+    }
+
+    // role: 0 = default device (console), 1 = multimedia, 2 = communications
+    public static int SetDefault(string id, int role)
+    {
+        IPolicyConfig pc = (IPolicyConfig)new PolicyConfigClientClass();
+        return pc.SetDefaultEndpoint(id, role);
+    }
+
+    public static int SetVolume(string id, float scalar)
+    {
+        IMMDevice dev = Open(id);
+        Guid iid = IidEndpointVolume;
+        object o;
+        int hr = dev.Activate(ref iid, 23, IntPtr.Zero, out o);
+        if (hr != 0) return hr;
+        Guid ctx = Guid.Empty;
+        return ((IAudioEndpointVolume)o).SetMasterVolumeLevelScalar(scalar, ref ctx);
+    }
+
+    public static float GetVolume(string id)
+    {
+        IMMDevice dev = Open(id);
+        Guid iid = IidEndpointVolume;
+        object o;
+        if (dev.Activate(ref iid, 23, IntPtr.Zero, out o) != 0) return -1f;
+        float level;
+        if (((IAudioEndpointVolume)o).GetMasterVolumeLevelScalar(out level) != 0) return -1f;
+        return level;
+    }
+
+    // Writes the endpoint name shown in Sound settings (PKEY_Device_DeviceDesc).
+    public static int Rename(string id, string name)
+    {
+        IMMDevice dev = Open(id);
+        IPropertyStore store;
+        int hr = dev.OpenPropertyStore(2, out store);
+        if (hr != 0) return hr;
+        PropertyKey key = new PropertyKey();
+        key.fmtid = FmtDevice;
+        key.pid = 2;
+        PropVariant v = new PropVariant();
+        v.vt = 31;
+        v.p1 = Marshal.StringToCoTaskMemUni(name);
+        hr = store.SetValue(ref key, ref v);
+        if (hr == 0) hr = store.Commit();
+        PropVariantClear(ref v);
+        return hr;
+    }
+}
+'@
+
+function Get-AudioEndpoint {
+    param([int]$Flow, [string[]]$Pattern)
+    @([MtrAudio]::GetEndpoints($Flow) | Where-Object {
+        $ep = $_
+        @($Pattern | Where-Object { $ep.Desc -like $_ -or $ep.FriendlyName -like $_ }).Count
+    }) | Sort-Object State
+}
+
+function Format-Hr { param([int]$Hr) '0x{0:X8}' -f $Hr }
+
+try {
+    Add-Type -TypeDefinition $audioSource -ErrorAction Stop
+    $audioReady = $true
+}
+catch {
+    $audioReady = $false
+    Write-Host "  Audio API                                  = FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Add-Result 'Audio API' 'load' 'FAILED' $_.Exception.Message
+}
+
+if ($audioReady) {
+    try {
+        # A re-run finds the devices under the names given on the first run.
+        $outPatterns     = @('Echo Cancelling Speakerphone*', 'DSP*', 'Room Audio Output*')
+        $inPatterns      = @('Echo Cancelling Speakerphone*', 'DSP*', 'Room Mics*')
+        $contentPatterns = @('*Tap HDMI Capture*', '*Yealink Capture*', '*mTouch*', '*HDMI Capture*', 'Content Capture Input*')
+
+        $outDevice = @(Get-AudioEndpoint 0 $outPatterns) | Select-Object -First 1
+        $inDevice  = @(Get-AudioEndpoint 1 $inPatterns)  | Select-Object -First 1
+        # Some DSPs name their playback endpoint differently (for example just "DSP"), so
+        # when only one side is found as the speakerphone, take the other side from the
+        # same device.
+        if (-not $outDevice -and $inDevice -and $inDevice.Adapter) {
+            $outDevice = @([MtrAudio]::GetEndpoints(0) | Where-Object { $_.Adapter -eq $inDevice.Adapter } | Sort-Object State) | Select-Object -First 1
+            if ($outDevice) { Add-Result 'Audio output match' $outDevice.FriendlyName 'OK' "paired with the speakerphone input by device: $($inDevice.Adapter)" }
+        }
+        if (-not $inDevice -and $outDevice -and $outDevice.Adapter) {
+            $inDevice = @([MtrAudio]::GetEndpoints(1) | Where-Object { $_.Adapter -eq $outDevice.Adapter } | Sort-Object State) | Select-Object -First 1
+            if ($inDevice) { Add-Result 'Audio input match' $inDevice.FriendlyName 'OK' "paired with the speakerphone output by device: $($outDevice.Adapter)" }
+        }
+        $content   = @(Get-AudioEndpoint 1 $contentPatterns | Where-Object { $_.Id -ne $inDevice.Id })
+
+        if (-not $outDevice -and -not $inDevice) {
+            Write-Host ("  {0,-42} = not found, audio left as it is" -f 'Echo Cancelling Speakerphone') -ForegroundColor DarkGray
+            Add-Result 'Audio devices' 'no Echo Cancelling Speakerphone' 'SKIP' 'nothing changed'
+        }
+
+        # --- Output: the speakerphone only ---
+        if ($outDevice) {
+            if ($outDevice.State -eq 2) {
+                $hr = [MtrAudio]::SetVisible($outDevice.Id, $true)
+                Add-Result 'Audio output enabled' $outDevice.FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "hr $(Format-Hr $hr)"
+                Start-Sleep -Milliseconds 800
+            }
+            $hr = [MtrAudio]::Rename($outDevice.Id, 'Room Audio Output')
+            Write-Host ("  {0,-42} = Room Audio Output" -f 'Output name')
+            Add-Result 'Audio output name' 'Room Audio Output' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($outDevice.Adapter) - hr $(Format-Hr $hr)"
+
+            $hr = [MtrAudio]::SetVolume($outDevice.Id, [single]0.6)
+            $now = [math]::Round([MtrAudio]::GetVolume($outDevice.Id) * 100)
+            Write-Host ("  {0,-42} = {1}" -f 'Output volume', $now)
+            Add-Result 'Audio output volume' "$now" $(if ($hr -eq 0 -and $now -eq 60) { 'OK' } else { 'FAILED' }) "wanted 60 - hr $(Format-Hr $hr)"
+
+            foreach ($role in 0, 1, 2) { $hr = [MtrAudio]::SetDefault($outDevice.Id, $role); if ($hr -ne 0) { break } }
+            Write-Host ("  {0,-42} = default" -f 'Output role')
+            Add-Result 'Audio output default' 'default device' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "hr $(Format-Hr $hr)"
+
+            $others = @([MtrAudio]::GetEndpoints(0) | Where-Object { $_.Id -ne $outDevice.Id -and ($_.State -eq 1 -or $_.State -eq 8) })
+            foreach ($o in $others) {
+                $hr = [MtrAudio]::SetVisible($o.Id, $false)
+                Write-Host ("  {0,-42} = disabled" -f "Output: $($o.FriendlyName)")
+                Add-Result 'Audio output disabled' $o.FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($o.Adapter) - hr $(Format-Hr $hr)"
+            }
+            if (-not $others.Count) { Add-Result 'Audio output disabled' 'none to disable' 'OK' '' }
+        }
+        elseif ($inDevice) {
+            Add-Result 'Audio output' 'no Echo Cancelling Speakerphone output' 'SKIP' 'outputs left as they are'
+        }
+
+        # --- Input: the speakerphone and the content capture only ---
+        if ($inDevice) {
+            if ($inDevice.State -eq 2) {
+                $hr = [MtrAudio]::SetVisible($inDevice.Id, $true)
+                Add-Result 'Audio input enabled' $inDevice.FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "hr $(Format-Hr $hr)"
+                Start-Sleep -Milliseconds 800
+            }
+            $hr = [MtrAudio]::Rename($inDevice.Id, 'Room Mics')
+            Write-Host ("  {0,-42} = Room Mics" -f 'Input name')
+            Add-Result 'Audio input name' 'Room Mics' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($inDevice.Adapter) - hr $(Format-Hr $hr)"
+
+            $hr = [MtrAudio]::SetVolume($inDevice.Id, [single]1.0)
+            $now = [math]::Round([MtrAudio]::GetVolume($inDevice.Id) * 100)
+            Write-Host ("  {0,-42} = {1}" -f 'Room Mics volume', $now)
+            Add-Result 'Audio input volume' "$now" $(if ($hr -eq 0 -and $now -eq 100) { 'OK' } else { 'FAILED' }) "wanted 100 - hr $(Format-Hr $hr)"
+
+            $hr = [MtrAudio]::SetDefault($inDevice.Id, 2)
+            Write-Host ("  {0,-42} = default communications" -f 'Room Mics role')
+            Add-Result 'Audio input default' 'default communications device' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "hr $(Format-Hr $hr)"
+
+            $keep = @($inDevice.Id)
+            if ($content.Count) {
+                foreach ($c in $content) {
+                    $keep += $c.Id
+                    if ($c.State -eq 2) { [void][MtrAudio]::SetVisible($c.Id, $true); Start-Sleep -Milliseconds 800 }
+                    $hr = [MtrAudio]::SetVolume($c.Id, [single]1.0)
+                    $now = [math]::Round([MtrAudio]::GetVolume($c.Id) * 100)
+                    Add-Result 'Audio content capture volume' "$now" $(if ($hr -eq 0 -and $now -eq 100) { 'OK' } else { 'FAILED' }) "$($c.FriendlyName) - wanted 100 - hr $(Format-Hr $hr)"
+                }
+                $hr = 0
+                foreach ($role in 0, 1) { $hr = [MtrAudio]::SetDefault($content[0].Id, $role); if ($hr -ne 0) { break } }
+                Write-Host ("  {0,-42} = default device" -f "Capture: $($content[0].FriendlyName)")
+                Add-Result 'Audio content capture default' $content[0].FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "default device - hr $(Format-Hr $hr)"
+
+                $hr = [MtrAudio]::Rename($content[0].Id, 'Content Capture Input')
+                Write-Host ("  {0,-42} = Content Capture Input" -f 'Content capture name')
+                Add-Result 'Audio content capture name' 'Content Capture Input' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($content[0].Adapter) - hr $(Format-Hr $hr)"
+            } else {
+                Add-Result 'Audio content capture' 'not found' 'SKIP' 'no input matching Tap HDMI Capture, Yealink Capture, mTouch or HDMI Capture'
+            }
+
+            $offIn = @([MtrAudio]::GetEndpoints(1) | Where-Object { $keep -notcontains $_.Id -and ($_.State -eq 1 -or $_.State -eq 8) })
+            foreach ($o in $offIn) {
+                $hr = [MtrAudio]::SetVisible($o.Id, $false)
+                Write-Host ("  {0,-42} = disabled" -f "Input: $($o.FriendlyName)")
+                Add-Result 'Audio input disabled' $o.FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($o.Adapter) - hr $(Format-Hr $hr)"
+            }
+            if (-not $offIn.Count) { Add-Result 'Audio input disabled' 'none to disable' 'OK' '' }
+        }
+        elseif ($outDevice) {
+            Add-Result 'Audio input' 'no Echo Cancelling Speakerphone input' 'SKIP' 'inputs left as they are'
+        }
+    }
+    catch {
+        Write-Host "  Audio                                      = FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        Add-Result 'Audio' 'configure' 'FAILED' $_.Exception.Message
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+# 11. REPORT
+# ---------------------------------------------------------------------------
+Write-Host "`n[11] Writing report" -ForegroundColor Cyan
+
+$restartReasons = @(Get-PendingRestartReasons)
 
 $os   = Get-CimInstance Win32_OperatingSystem
 $cs   = Get-CimInstance Win32_ComputerSystem
@@ -1012,7 +2221,7 @@ if (-not $ips) { $ips = @('none') }
 $stamp    = Get-Date
 $failed   = @($script:Results | Where-Object Status -eq 'FAILED')
 $skipped  = @($script:Results | Where-Object Status -eq 'SKIP')
-$logName  = "$env:COMPUTERNAME-MTR-Applied-Settings.log"
+$logName  = "${ReportHost}_Applied-Settings.log"
 $logPath  = Join-Path $workDir $logName
 
 $report = New-Object System.Text.StringBuilder
@@ -1020,13 +2229,13 @@ function Add-Line { param($t = '') [void]$report.AppendLine($t) }
 
 Add-Line '============================================================'
 Add-Line ' MTR Windows standardisation'
-Add-Line " Script: v$ScriptVersion"
+Add-Line " Script: v$ScriptVersion (network)"
 Add-Line " Run:    $($stamp.ToString('yyyy-MM-dd HH:mm:ss'))"
 Add-Line " User:   $env:USERDOMAIN\$env:USERNAME"
 Add-Line '============================================================'
 Add-Line
 Add-Line '--- MACHINE ------------------------------------------------'
-Add-Line ("  {0,-22} {1}" -f 'Hostname',     $env:COMPUTERNAME)
+Add-Line ("  {0,-22} {1}" -f 'Hostname',     $(if ($hostChangeNote) { "$ReportHost (renamed from $currentHost - restart needed)" } else { $ReportHost }))
 Add-Line ("  {0,-22} {1}" -f 'Manufacturer', $cs.Manufacturer)
 Add-Line ("  {0,-22} {1}" -f 'Model',        $cs.Model)
 Add-Line ("  {0,-22} {1}" -f 'Serial',       $bios.SerialNumber)
@@ -1034,6 +2243,7 @@ Add-Line ("  {0,-22} {1}" -f 'BIOS',         $bios.SMBIOSBIOSVersion)
 Add-Line ("  {0,-22} {1}" -f 'Windows',      $winVersion)
 Add-Line ("  {0,-22} {1}" -f 'MTR app',      $mtrApp)
 Add-Line ("  {0,-22} {1}" -f 'Last boot',    $os.LastBootUpTime)
+Add-Line ("  {0,-22} {1}" -f 'Restart pending', $(if ($restartReasons.Count) { 'yes - ' + ($restartReasons -join ', ') } else { 'no' }))
 foreach ($i in $ips) { Add-Line ("  {0,-22} {1}" -f 'IPv4', $i) }
 Add-Line
 Add-Line '--- SETTINGS APPLIED ---------------------------------------'
@@ -1069,10 +2279,24 @@ Add-Line
 Add-Line '  Not verified visually - confirm under Taskbar behaviours:'
 Add-Line '    Show flashing, Share any window, Smaller taskbar buttons'
 Add-Line
+if ($restartReasons.Count) {
+    Add-Line "  Restart pending: $($restartReasons -join ', ')."
+    Add-Line '  The launcher restarts the MTR after its countdown instead of logging off.'
+    Add-Line
+}
+if ($script:TaskbarPinsSet) {
+    Add-Line '  Taskbar pins appear when Explorer restarts at the end of this run.'
+    Add-Line
+}
+if ($script:DefaultBrowserSet) {
+    Add-Line '  Firefox becomes the default browser at the next sign-in of this account'
+    Add-Line '  (Windows applies the default associations file when a user signs in).'
+    Add-Line
+}
 Add-Line '  WinRM is enabled on this machine, but it is a workgroup machine'
 Add-Line '  (not domain-joined) - connecting from another PC still needs that'
 Add-Line '  PC''s own TrustedHosts set first, e.g. from an elevated prompt there:'
-Add-Line "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$env:COMPUTERNAME' -Concatenate"
+Add-Line "    Set-Item WSMan:\localhost\Client\TrustedHosts -Value '$ReportHost' -Concatenate"
 Add-Line '  then connect with -Credential using this machine''s local Admin account.'
 Add-Line
 
@@ -1081,6 +2305,7 @@ Write-Host "  report     = $logPath"
 
 # Upload to the share. Not recorded via Add-Result - the report is already
 # written, so a result added here would not appear in the file it describes.
+foreach ($root in $shareRoots) { net use $root /delete 2>&1 | Out-Null }
 $logShareRoot = ($LogShare -split '\\')[0..3] -join '\'
 net use $logShareRoot /user:"$ShareHost\$ShareUser" "$SharePass" 2>&1 | Out-Null
 try {
@@ -1094,16 +2319,27 @@ catch {
 }
 net use $logShareRoot /delete 2>&1 | Out-Null
 
-
 # ---------------------------------------------------------------------------
-# 13. APPLY
+# 12. APPLY
 # ---------------------------------------------------------------------------
-Write-Host "`n[13] Restarting Explorer to apply..." -ForegroundColor Cyan
+Write-Host "`n[12] Restarting Explorer to apply..." -ForegroundColor Cyan
 Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
+
+# Explorer keeps the pins it already has in Taskband and then ignores the layout
+# file, so a re-run (or an image that signed in once) keeps its old pins. With
+# Explorer stopped, drop the saved pins so the layout file is applied afresh.
+if ($script:TaskbarPinsSet) {
+    $taskband = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband'
+    foreach ($v in 'Favorites', 'FavoritesResolve', 'FavoritesChanges', 'FavoritesVersion', 'FavoritesRemovedChanges', 'LayoutXMLLastModified') {
+        Remove-ItemProperty -Path $taskband -Name $v -ErrorAction SilentlyContinue
+    }
+    Write-Host "  Taskbar saved pins cleared (layout file applies on the Explorer start below)"
+}
 if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
 
-Write-Host "`nDone. Applied to $env:COMPUTERNAME\$env:USERNAME" -ForegroundColor Green
+Write-Host "`nDone. Applied to $ReportHost\$env:USERNAME" -ForegroundColor Green
+if ($restartReasons.Count) { Write-Host "Restart pending: $($restartReasons -join ', ')." -ForegroundColor Yellow }
 
 if ($failed.Count) {
     Write-Host "$($failed.Count) of $($script:Results.Count) settings FAILED:" -ForegroundColor Red
@@ -1113,3 +2349,7 @@ if ($failed.Count) {
 }
 
 Write-Host "`nReport: $logPath`n"
+
+# 3010 (the Windows "restart required" code) tells run-mtr_setup.bat to restart
+# the MTR after its countdown instead of logging off.
+if ($restartReasons.Count) { exit 3010 }

@@ -7,7 +7,7 @@
 
     Runs entirely from the USB stick and assumes no network access to anything
     else: the wallpaper comes from .\assets and the installers from
-    .\assets\Software, and the per-host report is written to .\logs on the stick as well as
+    .\assets\software, and the per-host report is written to .\logs on the stick as well as
     Downloads\_mtrsetup on the MTR.
 
     Usage:  run-mtr_setup.bat            (or, from an elevated prompt:
@@ -24,7 +24,7 @@ param(
     [string]$SourceFile        = (Join-Path $AssetsRoot 'AV-OOS-BG-Blue.png'),
     [string]$TempFolderName    = '_mtrsetup',
     [string]$SoftwareFolderName = 'Software',
-    [string]$InstallersRoot    = (Join-Path $AssetsRoot 'Software'),
+    [string]$InstallersRoot    = (Join-Path $AssetsRoot 'software'),
     [string]$ExtronMtrZip      = (Join-Path $InstallersRoot 'Extron\ExtronControlforMicrosoftTeamsRooms_2x5x1.zip'),
     [string]$ExtronMsiName     = 'ExtronControlforMicrosoftTeamsRooms.msi',
     [string]$LogiSyncExe       = (Join-Path $InstallersRoot 'Logitech\LogiSyncApp-Setup.exe'),
@@ -49,7 +49,7 @@ param(
 )
 
 # Bump on every change to this file, format YYYY.MM.DD-NNN.
-$ScriptVersion = '2026.10.21-001'
+$ScriptVersion = '2026.10.23-001'
 
 $ErrorActionPreference = 'Continue'
 
@@ -157,7 +157,8 @@ function Get-PendingRestartReasons {
 # Setup prompt: tick-boxes for which software to install, plus how long before
 # the display turns off. Shown once, up front, so a tech can choose and walk
 # away: if nobody touches it, it carries on with the ticked items and the
-# current display value after $Seconds. "Skip installs" or closing the window
+# installs nothing but still applies the display setting. "Cancel" or closing the window
+# stops the script before anything is changed (exit code 2).
 # installs nothing but still applies the display setting. Returns an object
 # with Software (the ticked names) and DisplayTimeoutMinutes (0 = never).
 function Show-SetupPrompt {
@@ -173,7 +174,7 @@ function Show-SetupPrompt {
     $form.MaximizeBox     = $false
     $form.MinimizeBox     = $false
     $form.TopMost         = $true
-    $form.ClientSize      = New-Object System.Drawing.Size(340, 290)
+    $form.ClientSize      = New-Object System.Drawing.Size(340, 312)
 
     $heading          = New-Object System.Windows.Forms.Label
     $heading.Text     = 'Tick what to install on this MTR:'
@@ -205,25 +206,36 @@ function Show-SetupPrompt {
     }
     $off.SelectedIndex = [array]::IndexOf($offValues, $DisplayMinutes)
 
+    $force          = New-Object System.Windows.Forms.CheckBox
+    $force.Text     = 'Overwrite Hostname'
+    $force.Location = New-Object System.Drawing.Point(16, 204)
+    $force.Size     = New-Object System.Drawing.Size(308, 22)
+
     $countdown          = New-Object System.Windows.Forms.Label
-    $countdown.Location = New-Object System.Drawing.Point(16, 208)
+    $countdown.Location = New-Object System.Drawing.Point(16, 234)
     $countdown.Size     = New-Object System.Drawing.Size(308, 20)
 
     $ok              = New-Object System.Windows.Forms.Button
-    $ok.Text         = 'Continue'
-    $ok.Location     = New-Object System.Drawing.Point(122, 246)
-    $ok.Size         = New-Object System.Drawing.Size(92, 28)
+    $ok.Text         = 'Config + Software'
+    $ok.Location     = New-Object System.Drawing.Point(16, 268)
+    $ok.Size         = New-Object System.Drawing.Size(136, 28)
     $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
 
+    $configOnly              = New-Object System.Windows.Forms.Button
+    $configOnly.Text         = 'Config Only'
+    $configOnly.Location     = New-Object System.Drawing.Point(160, 268)
+    $configOnly.Size         = New-Object System.Drawing.Size(96, 28)
+    $configOnly.DialogResult = [System.Windows.Forms.DialogResult]::Ignore
+
     $cancel              = New-Object System.Windows.Forms.Button
-    $cancel.Text         = 'Skip installs'
-    $cancel.Location     = New-Object System.Drawing.Point(222, 246)
-    $cancel.Size         = New-Object System.Drawing.Size(102, 28)
+    $cancel.Text         = 'Cancel'
+    $cancel.Location     = New-Object System.Drawing.Point(264, 268)
+    $cancel.Size         = New-Object System.Drawing.Size(60, 28)
     $cancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 
     $form.AcceptButton = $ok
     $form.CancelButton = $cancel
-    $form.Controls.AddRange(@($heading, $list, $offLabel, $off, $countdown, $ok, $cancel))
+    $form.Controls.AddRange(@($heading, $list, $offLabel, $off, $force, $countdown, $ok, $configOnly, $cancel))
 
     $script:promptLeft = $Seconds
     $countdown.Text    = "Carrying on with these settings in $($script:promptLeft)s..."
@@ -242,16 +254,19 @@ function Show-SetupPrompt {
     # Any change means someone is at the keyboard - stop the auto-continue.
     $list.Add_ItemCheck({ $timer.Stop(); $countdown.Text = '' })
     $off.Add_SelectedIndexChanged({ $timer.Stop(); $countdown.Text = '' })
+    $force.Add_CheckedChanged({ $timer.Stop(); $countdown.Text = '' })
     $timer.Start()
 
     $result  = $form.ShowDialog()
     $timer.Dispose()
     $checked = @($list.CheckedItems | ForEach-Object { "$_" })
     $minutes = $offValues[$off.SelectedIndex]
+    $forceRename = $force.Checked
     $form.Dispose()
     $picked = @()
     if ($result -eq [System.Windows.Forms.DialogResult]::OK) { $picked = $checked }
-    [pscustomobject]@{ Software = $picked; DisplayTimeoutMinutes = $minutes }
+    $cancelled = ($result -ne [System.Windows.Forms.DialogResult]::OK -and $result -ne [System.Windows.Forms.DialogResult]::Ignore)
+    [pscustomobject]@{ Software = $picked; DisplayTimeoutMinutes = $minutes; Cancelled = $cancelled; ForceRename = $forceRename }
 }
 
 # Windows names a fresh PC DESKTOP-xxxxxxx. If that is still the name, ask for
@@ -268,7 +283,7 @@ function Test-HostnameValid {
 # Asks for a new hostname. Returns the name, or $null to leave it alone (Keep
 # current name, closing the window, or nobody typing anything for $Seconds).
 function Read-NewHostname {
-    param([string]$Current, [int]$Seconds)
+    param([string]$Current, [int]$Seconds, [switch]$Forced)
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -283,7 +298,7 @@ function Read-NewHostname {
     $form.ClientSize      = New-Object System.Drawing.Size(360, 214)
 
     $info          = New-Object System.Windows.Forms.Label
-    $info.Text     = "This PC still has the default Windows name ($Current). Enter a new hostname:"
+    $info.Text     = if ($Forced) { "This PC is named $Current. Enter a new hostname:" } else { "This PC still has the default Windows name ($Current). Enter a new hostname:" }
     $info.Location = New-Object System.Drawing.Point(16, 14)
     $info.Size     = New-Object System.Drawing.Size(328, 36)
 
@@ -352,23 +367,48 @@ function Read-NewHostname {
     return $script:chosenHostname
 }
 
+$selected = @($DefaultSelection)
+$ForceHostnameRename = $false
+if ($Install) {
+    $selected = @($SoftwareChoices | Where-Object { $c = $_; @($Install | Where-Object { $c -like "$_*" }).Count })
+}
+elseif (-not $NoPrompt) {
+    try {
+        $choice = Show-SetupPrompt -Choices $SoftwareChoices -Unticked $UntickedByDefault -DisplayMinutes $DisplayTimeoutMinutes -Seconds $PromptSeconds
+        if ($choice.Cancelled) {
+            Write-Host "`nCancelled - nothing was changed." -ForegroundColor Yellow
+            exit 2
+        }
+        $selected = @($choice.Software)
+        $DisplayTimeoutMinutes = $choice.DisplayTimeoutMinutes
+        $ForceHostnameRename = [bool]$choice.ForceRename
+    }
+    catch { Write-Warning "Could not show the setup prompt ($($_.Exception.Message)) - going with the default software selection" }
+}
+$doExtron = $selected -contains 'Extron Control'
+$doLogi   = $selected -contains 'Logitech Sync'
+$doVnc    = $selected -contains 'TightVNC'
+$doFirefox = $selected -contains 'Firefox ESR'
+$do7zip    = $selected -contains '7-Zip'
+$doSplash  = $selected -contains 'Splashtop Streamer'
+
 Write-Section 0 "Hostname"
 $currentHost    = $env:COMPUTERNAME
 $ReportHost     = $currentHost
 $hostChangeNote = $null
-if ($currentHost -notmatch $DefaultNamePattern) {
+if ($currentHost -notmatch $DefaultNamePattern -and -not $ForceHostnameRename) {
     Write-Host ("  {0,-42} = {1}" -f 'Hostname', $currentHost)
     Add-Result 'Hostname' $currentHost 'OK' 'not a Windows default name - left as is'
 }
 else {
     $newName = $NewHostname
     if (-not $newName -and -not $NoPrompt) {
-        try { $newName = Read-NewHostname -Current $currentHost -Seconds $PromptSeconds }
+        try { $newName = Read-NewHostname -Current $currentHost -Seconds $PromptSeconds -Forced:($currentHost -notmatch $DefaultNamePattern) }
         catch { Write-Warning "Could not show the hostname prompt ($($_.Exception.Message))" }
     }
-    if (-not $newName) {
-        Write-Host ("  {0,-42} = {1} (still the Windows default, left as is)" -f 'Hostname', $currentHost) -ForegroundColor Yellow
-        Add-Result 'Hostname' $currentHost 'SKIP' 'still the Windows default - no new name entered'
+    if (-not $newName -or $newName -eq $currentHost) {
+        Write-Host ("  {0,-42} = {1} (left as is)" -f 'Hostname', $currentHost) -ForegroundColor Yellow
+        Add-Result 'Hostname' $currentHost 'SKIP' 'no new name entered'
     }
     elseif (-not (Test-HostnameValid $newName)) {
         Write-Host ("  {0,-42} = FAILED: '{1}' is not a valid hostname" -f 'Hostname', $newName) -ForegroundColor Red
@@ -390,24 +430,6 @@ else {
     }
 }
 
-$selected = @($DefaultSelection)
-if ($Install) {
-    $selected = @($SoftwareChoices | Where-Object { $c = $_; @($Install | Where-Object { $c -like "$_*" }).Count })
-}
-elseif (-not $NoPrompt) {
-    try {
-        $choice = Show-SetupPrompt -Choices $SoftwareChoices -Unticked $UntickedByDefault -DisplayMinutes $DisplayTimeoutMinutes -Seconds $PromptSeconds
-        $selected = @($choice.Software)
-        $DisplayTimeoutMinutes = $choice.DisplayTimeoutMinutes
-    }
-    catch { Write-Warning "Could not show the setup prompt ($($_.Exception.Message)) - going with the default software selection" }
-}
-$doExtron = $selected -contains 'Extron Control'
-$doLogi   = $selected -contains 'Logitech Sync'
-$doVnc    = $selected -contains 'TightVNC'
-$doFirefox = $selected -contains 'Firefox ESR'
-$do7zip    = $selected -contains '7-Zip'
-$doSplash  = $selected -contains 'Splashtop Streamer'
 
 
 # ---------------------------------------------------------------------------
@@ -723,18 +745,28 @@ if ($LASTEXITCODE -eq 0) {
     Add-Result 'Power scheme activated' 'no' 'FAILED' "powercfg /setactive $scheme returned $LASTEXITCODE"
 }
 
-# Let the Tap's sensors wake the NUC. Not every NUC has both devices.
-foreach ($dev in @('HID Human Presence Sensor', 'HID-compliant touch screen')) {
-    $out = & powercfg /deviceenablewake $dev
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host ("  {0,-42} = wake enabled" -f $dev)
-        Add-Result "Wake: $dev" 'enabled' 'OK' ''
-    } else {
-        Write-Host ("  {0,-42} = not present" -f $dev) -ForegroundColor DarkGray
-        Add-Result "Wake: $dev" 'not present' 'SKIP' (($out | Where-Object { $_ }) -join ' ')
+# Let the Tap's sensors wake the NUC. Not every NUC has both devices. powercfg
+# lists a device with an instance suffix when there is more than one of that
+# name (e.g. "HID-compliant touch screen (001)") and only accepts that full name.
+$wakeProgrammable = @(& powercfg /devicequery wake_programmable 2>&1 | ForEach-Object { "$_".Trim() } | Where-Object { $_ })
+foreach ($want in @('HID Human Presence Sensor', 'HID-compliant touch screen')) {
+    $names = @($wakeProgrammable | Where-Object { $_ -eq $want -or $_ -like "$want (*)" })
+    if (-not $names.Count) {
+        Write-Host ("  {0,-42} = not present" -f $want) -ForegroundColor DarkGray
+        Add-Result "Wake: $want" 'not present' 'SKIP' 'not in the wake-programmable device list'
+        continue
+    }
+    foreach ($dev in $names) {
+        $out = & powercfg /deviceenablewake $dev 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host ("  {0,-42} = wake enabled" -f $dev)
+            Add-Result "Wake: $dev" 'enabled' 'OK' ''
+        } else {
+            Write-Host ("  {0,-42} = FAILED" -f $dev) -ForegroundColor Red
+            Add-Result "Wake: $dev" 'enable' 'FAILED' (($out | Where-Object { $_ }) -join ' ')
+        }
     }
 }
-
 # Stop Windows powering down USB devices - keeps the Tap, camera and mic on the bus
 try {
     $powerMgmt = @(Get-CimInstance -ClassName MSPower_DeviceEnable -Namespace root/WMI -ErrorAction Stop)
@@ -774,6 +806,15 @@ $workDir = Join-Path $downloads $TempFolderName
 New-Item -Path $workDir -ItemType Directory -Force | Out-Null
 Write-Host "  created    = $workDir"
 Add-Result 'Temp folder' $TempFolderName 'OK' $workDir
+
+# Desktop shortcut to the work folder, so the reports and installer logs are one click away.
+$folderLnkPath = Join-Path ([Environment]::GetFolderPath('Desktop')) "$TempFolderName.lnk"
+$folderLnk = (New-Object -ComObject WScript.Shell).CreateShortcut($folderLnkPath)
+$folderLnk.TargetPath  = $workDir
+$folderLnk.Description = "MTR setup work folder - $workDir"
+$folderLnk.Save()
+Write-Host "  shortcut   = $folderLnkPath  ->  $workDir"
+Add-Result 'Shortcut' ([IO.Path]::GetFileName($folderLnkPath)) 'OK' "$folderLnkPath -> $workDir"
 
 # MTR management console - kept in _mtrsetup, with a Desktop shortcut to that copy.
 $mmcName = [IO.Path]::GetFileName($MmcFile)
@@ -1163,6 +1204,49 @@ else {
 }
 
 
+# --- Default browser: Firefox ---
+# Windows protects each user's own default (the UserChoice value is hashed), so it is set
+# the supported way: a default associations file named by policy, which Windows applies to
+# every account at sign-in, plus the same file imported for new profiles. The ProgIds come
+# from what Firefox registered, so it only runs when Firefox is installed.
+try {
+    $ffReg = @((Get-ItemProperty 'HKLM:\SOFTWARE\RegisteredApplications' -ErrorAction Stop).PSObject.Properties | Where-Object { $_.Name -like 'Firefox*' }) | Select-Object -First 1
+    $ffUrl = $null; $ffHtml = $null
+    if ($ffReg) {
+        $ffCap  = 'HKLM:\' + $ffReg.Value
+        $ffUrl  = (Get-ItemProperty "$ffCap\URLAssociations"  -ErrorAction SilentlyContinue).http
+        $ffHtml = (Get-ItemProperty "$ffCap\FileAssociations" -ErrorAction SilentlyContinue).'.html'
+    }
+    if (-not $ffUrl -or -not $ffHtml) {
+        Write-Host ("  {0,-42} = Firefox not installed" -f 'Default browser') -ForegroundColor DarkGray
+        Add-Result 'Default browser' 'Firefox' 'SKIP' 'Firefox is not registered on this machine'
+    } else {
+        $assoc = @()
+        foreach ($p in 'http', 'https') { $assoc += "  <Association Identifier=`"$p`" ProgId=`"$ffUrl`" ApplicationName=`"Firefox`" />" }
+        foreach ($x in '.htm', '.html', '.shtml', '.xht', '.xhtml') { $assoc += "  <Association Identifier=`"$x`" ProgId=`"$ffHtml`" ApplicationName=`"Firefox`" />" }
+        $assocXml = "<?xml version=`"1.0`" encoding=`"UTF-8`"?>`r`n<DefaultAssociations>`r`n" + ($assoc -join "`r`n") + "`r`n</DefaultAssociations>`r`n"
+        $assocFile = Join-Path $env:ProgramData 'MTR-Setup\DefaultAssociations.xml'
+        $assocDir  = Split-Path $assocFile
+        if (-not (Test-Path $assocDir)) { New-Item -Path $assocDir -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+        $assocNow = if (Test-Path $assocFile) { [IO.File]::ReadAllText($assocFile) } else { $null }
+        if ($assocNow -cne $assocXml) { [IO.File]::WriteAllText($assocFile, $assocXml, (New-Object System.Text.UTF8Encoding($false))) }
+        Set-Reg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' 'DefaultAssociationsConfiguration' $assocFile 'String'
+        $dismOut = & dism.exe /Online /Import-DefaultAppAssociations:"$assocFile" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Add-Result 'Default browser' 'Firefox' 'OK' "http, https, .htm, .html set for every account at sign-in ($ffUrl)"
+            Write-Host ("  {0,-42} = Firefox (applies at sign-in)" -f 'Default browser')
+        } else {
+            Add-Result 'Default browser' 'Firefox' 'FAILED' "dism import returned $LASTEXITCODE - $((($dismOut | Where-Object { $_ }) -join ' ').Trim())"
+            Write-Host ("  {0,-42} = FAILED: dism returned {1}" -f 'Default browser', $LASTEXITCODE) -ForegroundColor Red
+        }
+        $script:DefaultBrowserSet = $true
+    }
+}
+catch {
+    Write-Host ("  {0,-42} = FAILED: {1}" -f 'Default browser', $_.Exception.Message) -ForegroundColor Red
+    Add-Result 'Default browser' 'Firefox' 'FAILED' $_.Exception.Message
+}
+
 # ---------------------------------------------------------------------------
 # 6. PERSONALIZATION > TASKBAR
 # ---------------------------------------------------------------------------
@@ -1342,11 +1426,21 @@ if ($maker -like '*Yealink*') {
     }
 }
 
-$syncLink = Find-StartMenuLink { param($file, $sc) $file.BaseName -like '*Logi*Sync*' }
+$syncExe  = Join-Path ${env:ProgramFiles(x86)} 'Logitech\LogiSync\frontend\Sync.exe'
+$syncLink = Find-StartMenuLink { param($file, $sc) $sc.TargetPath -eq $syncExe }
+if (-not $syncLink -and (Test-Path -LiteralPath $syncExe)) {
+    # Installed but no Start menu shortcut: make one so there is a .lnk to pin.
+    $syncPath = Join-Path $env:ALLUSERSPROFILE 'Microsoft\Windows\Start Menu\Programs\Logi Sync.lnk'
+    $syncSc = $pinShell.CreateShortcut($syncPath)
+    $syncSc.TargetPath = $syncExe
+    $syncSc.WorkingDirectory = Split-Path $syncExe
+    $syncSc.Save()
+    $syncLink = Get-Item -LiteralPath $syncPath
+}
 if ($syncLink) { Add-PinShortcut 'Logitech Sync' $syncLink.FullName }
 else {
     Write-Host ("  {0,-42} = not installed" -f 'Taskbar pin: Logitech Sync')
-    Add-Result 'Taskbar pin: Logitech Sync' 'not installed' 'SKIP' 'no Start menu shortcut named *Logi*Sync*'
+    Add-Result 'Taskbar pin: Logitech Sync' 'not installed' 'SKIP' "not found: $syncExe"
 }
 $layoutXml = @"
 <?xml version="1.0" encoding="utf-8"?>
@@ -1652,9 +1746,374 @@ catch {
 
 
 # ---------------------------------------------------------------------------
-# 10. REPORT
+# 10. AUDIO
 # ---------------------------------------------------------------------------
-Write-Host "`n[10] Writing report" -ForegroundColor Cyan
+# Same as doing it by hand in mmsys.cpl: the Echo Cancelling Speakerphone
+# (a QSYS DSP, Extron DSP USB interface or Logitech Rally System, whatever the room
+# has) is the only output, renamed Room Audio Output, volume 60 and the default
+# playback device. The inputs are cut down to that device (renamed Room Mics, volume 100,
+# default communications device) and the content capture input (volume 100, default
+# device). Endpoint state, names and volume are machine-wide; the default devices
+# are per user, so they are set for the account running this (Admin).
+# Nothing is changed when no Echo Cancelling Speakerphone is found, so a room is
+# never left with no audio. The Windows audio API has no cmdlets for this, hence the
+# small interop class.
+Write-Section 10 "Audio"
+
+$audioSource = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public class MtrAudioEndpoint
+{
+    public string Id;
+    public string Flow;
+    public int State;
+    public string FriendlyName;
+    public string Desc;
+    public string Adapter;
+}
+
+public static class MtrAudio
+{
+    [StructLayout(LayoutKind.Sequential)]
+    struct PropertyKey { public Guid fmtid; public int pid; }
+
+    [StructLayout(LayoutKind.Explicit)]
+    struct PropVariant
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr p1;
+        [FieldOffset(16)] public IntPtr p2;
+    }
+
+    [DllImport("ole32.dll")]
+    static extern int PropVariantClear(ref PropVariant pv);
+
+    [ComImport, Guid("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPropertyStore
+    {
+        [PreserveSig] int GetCount(out uint count);
+        [PreserveSig] int GetAt(uint index, out PropertyKey key);
+        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+        [PreserveSig] int Commit();
+    }
+
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice
+    {
+        [PreserveSig] int Activate(ref Guid iid, int clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object iface);
+        [PreserveSig] int OpenPropertyStore(int access, out IPropertyStore store);
+        [PreserveSig] int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
+        [PreserveSig] int GetState(out int state);
+    }
+
+    [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceCollection
+    {
+        [PreserveSig] int GetCount(out uint count);
+        [PreserveSig] int Item(uint index, out IMMDevice device);
+    }
+
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator
+    {
+        [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
+        [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
+        [PreserveSig] int GetDevice([MarshalAs(UnmanagedType.LPWStr)] string id, out IMMDevice device);
+    }
+
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumeratorClass { }
+
+    [ComImport, Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioEndpointVolume
+    {
+        [PreserveSig] int RegisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int UnregisterControlChangeNotify(IntPtr notify);
+        [PreserveSig] int GetChannelCount(out uint count);
+        [PreserveSig] int SetMasterVolumeLevel(float levelDb, ref Guid eventContext);
+        [PreserveSig] int SetMasterVolumeLevelScalar(float level, ref Guid eventContext);
+        [PreserveSig] int GetMasterVolumeLevel(out float levelDb);
+        [PreserveSig] int GetMasterVolumeLevelScalar(out float level);
+    }
+
+    [ComImport, Guid("F8679F50-850A-41CF-9C72-430F290290C8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IPolicyConfig
+    {
+        [PreserveSig] int GetMixFormat([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr format);
+        [PreserveSig] int GetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string name, int isDefault, IntPtr format);
+        [PreserveSig] int ResetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string name);
+        [PreserveSig] int SetDeviceFormat([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr endpointFormat, IntPtr mixFormat);
+        [PreserveSig] int GetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string name, int isDefault, IntPtr defaultPeriod, IntPtr minimumPeriod);
+        [PreserveSig] int SetProcessingPeriod([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr period);
+        [PreserveSig] int GetShareMode([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr mode);
+        [PreserveSig] int SetShareMode([MarshalAs(UnmanagedType.LPWStr)] string name, IntPtr mode);
+        [PreserveSig] int GetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string name, int fx, ref PropertyKey key, IntPtr value);
+        [PreserveSig] int SetPropertyValue([MarshalAs(UnmanagedType.LPWStr)] string name, int fx, ref PropertyKey key, IntPtr value);
+        [PreserveSig] int SetDefaultEndpoint([MarshalAs(UnmanagedType.LPWStr)] string name, int role);
+        [PreserveSig] int SetEndpointVisibility([MarshalAs(UnmanagedType.LPWStr)] string name, int visible);
+    }
+
+    [ComImport, Guid("870af99c-171d-4f9e-af0d-e63df40c2bc9")]
+    class PolicyConfigClientClass { }
+
+    static readonly Guid FmtDevice = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0");
+    static readonly Guid FmtInterface = new Guid("b3f8fa53-0004-438e-9003-51a46e139bfc");
+    static readonly Guid IidEndpointVolume = new Guid("5CDF2C82-841E-4546-9722-0CF74078229A");
+
+    static string ReadString(IPropertyStore store, Guid fmtid, int pid)
+    {
+        PropertyKey key = new PropertyKey();
+        key.fmtid = fmtid;
+        key.pid = pid;
+        PropVariant v;
+        if (store.GetValue(ref key, out v) != 0) return "";
+        string s = (v.vt == 31 && v.p1 != IntPtr.Zero) ? Marshal.PtrToStringUni(v.p1) : "";
+        PropVariantClear(ref v);
+        return s;
+    }
+
+    static IMMDevice Open(string id)
+    {
+        IMMDeviceEnumerator en = (IMMDeviceEnumerator)new MMDeviceEnumeratorClass();
+        IMMDevice dev;
+        int hr = en.GetDevice(id, out dev);
+        if (hr != 0) throw new COMException("GetDevice", hr);
+        return dev;
+    }
+
+    // Active, disabled and unplugged endpoints of one flow (0 = playback, 1 = recording).
+    public static List<MtrAudioEndpoint> GetEndpoints(int flow)
+    {
+        List<MtrAudioEndpoint> list = new List<MtrAudioEndpoint>();
+        IMMDeviceEnumerator en = (IMMDeviceEnumerator)new MMDeviceEnumeratorClass();
+        IMMDeviceCollection col;
+        int hr = en.EnumAudioEndpoints(flow, 11, out col);
+        if (hr != 0) throw new COMException("EnumAudioEndpoints", hr);
+        uint count;
+        col.GetCount(out count);
+        for (uint i = 0; i < count; i++)
+        {
+            IMMDevice dev;
+            if (col.Item(i, out dev) != 0) continue;
+            MtrAudioEndpoint ep = new MtrAudioEndpoint();
+            dev.GetId(out ep.Id);
+            dev.GetState(out ep.State);
+            ep.Flow = flow == 0 ? "Render" : "Capture";
+            IPropertyStore store;
+            if (dev.OpenPropertyStore(0, out store) == 0)
+            {
+                ep.FriendlyName = ReadString(store, FmtDevice, 14);
+                ep.Desc = ReadString(store, FmtDevice, 2);
+                ep.Adapter = ReadString(store, FmtInterface, 6);
+            }
+            list.Add(ep);
+        }
+        return list;
+    }
+
+    public static int SetVisible(string id, bool visible)
+    {
+        IPolicyConfig pc = (IPolicyConfig)new PolicyConfigClientClass();
+        return pc.SetEndpointVisibility(id, visible ? 1 : 0);
+    }
+
+    // role: 0 = default device (console), 1 = multimedia, 2 = communications
+    public static int SetDefault(string id, int role)
+    {
+        IPolicyConfig pc = (IPolicyConfig)new PolicyConfigClientClass();
+        return pc.SetDefaultEndpoint(id, role);
+    }
+
+    public static int SetVolume(string id, float scalar)
+    {
+        IMMDevice dev = Open(id);
+        Guid iid = IidEndpointVolume;
+        object o;
+        int hr = dev.Activate(ref iid, 23, IntPtr.Zero, out o);
+        if (hr != 0) return hr;
+        Guid ctx = Guid.Empty;
+        return ((IAudioEndpointVolume)o).SetMasterVolumeLevelScalar(scalar, ref ctx);
+    }
+
+    public static float GetVolume(string id)
+    {
+        IMMDevice dev = Open(id);
+        Guid iid = IidEndpointVolume;
+        object o;
+        if (dev.Activate(ref iid, 23, IntPtr.Zero, out o) != 0) return -1f;
+        float level;
+        if (((IAudioEndpointVolume)o).GetMasterVolumeLevelScalar(out level) != 0) return -1f;
+        return level;
+    }
+
+    // Writes the endpoint name shown in Sound settings (PKEY_Device_DeviceDesc).
+    public static int Rename(string id, string name)
+    {
+        IMMDevice dev = Open(id);
+        IPropertyStore store;
+        int hr = dev.OpenPropertyStore(2, out store);
+        if (hr != 0) return hr;
+        PropertyKey key = new PropertyKey();
+        key.fmtid = FmtDevice;
+        key.pid = 2;
+        PropVariant v = new PropVariant();
+        v.vt = 31;
+        v.p1 = Marshal.StringToCoTaskMemUni(name);
+        hr = store.SetValue(ref key, ref v);
+        if (hr == 0) hr = store.Commit();
+        PropVariantClear(ref v);
+        return hr;
+    }
+}
+'@
+
+function Get-AudioEndpoint {
+    param([int]$Flow, [string[]]$Pattern)
+    @([MtrAudio]::GetEndpoints($Flow) | Where-Object {
+        $ep = $_
+        @($Pattern | Where-Object { $ep.Desc -like $_ -or $ep.FriendlyName -like $_ }).Count
+    }) | Sort-Object State
+}
+
+function Format-Hr { param([int]$Hr) '0x{0:X8}' -f $Hr }
+
+try {
+    Add-Type -TypeDefinition $audioSource -ErrorAction Stop
+    $audioReady = $true
+}
+catch {
+    $audioReady = $false
+    Write-Host "  Audio API                                  = FAILED: $($_.Exception.Message)" -ForegroundColor Red
+    Add-Result 'Audio API' 'load' 'FAILED' $_.Exception.Message
+}
+
+if ($audioReady) {
+    try {
+        # A re-run finds the devices under the names given on the first run.
+        $outPatterns     = @('Echo Cancelling Speakerphone*', 'DSP*', 'Room Audio Output*')
+        $inPatterns      = @('Echo Cancelling Speakerphone*', 'DSP*', 'Room Mics*')
+        $contentPatterns = @('*Tap HDMI Capture*', '*Yealink Capture*', '*mTouch*', '*HDMI Capture*', 'Content Capture Input*')
+
+        $outDevice = @(Get-AudioEndpoint 0 $outPatterns) | Select-Object -First 1
+        $inDevice  = @(Get-AudioEndpoint 1 $inPatterns)  | Select-Object -First 1
+        # Some DSPs name their playback endpoint differently (for example just "DSP"), so
+        # when only one side is found as the speakerphone, take the other side from the
+        # same device.
+        if (-not $outDevice -and $inDevice -and $inDevice.Adapter) {
+            $outDevice = @([MtrAudio]::GetEndpoints(0) | Where-Object { $_.Adapter -eq $inDevice.Adapter } | Sort-Object State) | Select-Object -First 1
+            if ($outDevice) { Add-Result 'Audio output match' $outDevice.FriendlyName 'OK' "paired with the speakerphone input by device: $($inDevice.Adapter)" }
+        }
+        if (-not $inDevice -and $outDevice -and $outDevice.Adapter) {
+            $inDevice = @([MtrAudio]::GetEndpoints(1) | Where-Object { $_.Adapter -eq $outDevice.Adapter } | Sort-Object State) | Select-Object -First 1
+            if ($inDevice) { Add-Result 'Audio input match' $inDevice.FriendlyName 'OK' "paired with the speakerphone output by device: $($outDevice.Adapter)" }
+        }
+        $content   = @(Get-AudioEndpoint 1 $contentPatterns | Where-Object { $_.Id -ne $inDevice.Id })
+
+        if (-not $outDevice -and -not $inDevice) {
+            Write-Host ("  {0,-42} = not found, audio left as it is" -f 'Echo Cancelling Speakerphone') -ForegroundColor DarkGray
+            Add-Result 'Audio devices' 'no Echo Cancelling Speakerphone' 'SKIP' 'nothing changed'
+        }
+
+        # --- Output: the speakerphone only ---
+        if ($outDevice) {
+            if ($outDevice.State -eq 2) {
+                $hr = [MtrAudio]::SetVisible($outDevice.Id, $true)
+                Add-Result 'Audio output enabled' $outDevice.FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "hr $(Format-Hr $hr)"
+                Start-Sleep -Milliseconds 800
+            }
+            $hr = [MtrAudio]::Rename($outDevice.Id, 'Room Audio Output')
+            Write-Host ("  {0,-42} = Room Audio Output" -f 'Output name')
+            Add-Result 'Audio output name' 'Room Audio Output' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($outDevice.Adapter) - hr $(Format-Hr $hr)"
+
+            $hr = [MtrAudio]::SetVolume($outDevice.Id, [single]0.6)
+            $now = [math]::Round([MtrAudio]::GetVolume($outDevice.Id) * 100)
+            Write-Host ("  {0,-42} = {1}" -f 'Output volume', $now)
+            Add-Result 'Audio output volume' "$now" $(if ($hr -eq 0 -and $now -eq 60) { 'OK' } else { 'FAILED' }) "wanted 60 - hr $(Format-Hr $hr)"
+
+            foreach ($role in 0, 1, 2) { $hr = [MtrAudio]::SetDefault($outDevice.Id, $role); if ($hr -ne 0) { break } }
+            Write-Host ("  {0,-42} = default" -f 'Output role')
+            Add-Result 'Audio output default' 'default device' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "hr $(Format-Hr $hr)"
+
+            $others = @([MtrAudio]::GetEndpoints(0) | Where-Object { $_.Id -ne $outDevice.Id -and ($_.State -eq 1 -or $_.State -eq 8) })
+            foreach ($o in $others) {
+                $hr = [MtrAudio]::SetVisible($o.Id, $false)
+                Write-Host ("  {0,-42} = disabled" -f "Output: $($o.FriendlyName)")
+                Add-Result 'Audio output disabled' $o.FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($o.Adapter) - hr $(Format-Hr $hr)"
+            }
+            if (-not $others.Count) { Add-Result 'Audio output disabled' 'none to disable' 'OK' '' }
+        }
+        elseif ($inDevice) {
+            Add-Result 'Audio output' 'no Echo Cancelling Speakerphone output' 'SKIP' 'outputs left as they are'
+        }
+
+        # --- Input: the speakerphone and the content capture only ---
+        if ($inDevice) {
+            if ($inDevice.State -eq 2) {
+                $hr = [MtrAudio]::SetVisible($inDevice.Id, $true)
+                Add-Result 'Audio input enabled' $inDevice.FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "hr $(Format-Hr $hr)"
+                Start-Sleep -Milliseconds 800
+            }
+            $hr = [MtrAudio]::Rename($inDevice.Id, 'Room Mics')
+            Write-Host ("  {0,-42} = Room Mics" -f 'Input name')
+            Add-Result 'Audio input name' 'Room Mics' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($inDevice.Adapter) - hr $(Format-Hr $hr)"
+
+            $hr = [MtrAudio]::SetVolume($inDevice.Id, [single]1.0)
+            $now = [math]::Round([MtrAudio]::GetVolume($inDevice.Id) * 100)
+            Write-Host ("  {0,-42} = {1}" -f 'Room Mics volume', $now)
+            Add-Result 'Audio input volume' "$now" $(if ($hr -eq 0 -and $now -eq 100) { 'OK' } else { 'FAILED' }) "wanted 100 - hr $(Format-Hr $hr)"
+
+            $hr = [MtrAudio]::SetDefault($inDevice.Id, 2)
+            Write-Host ("  {0,-42} = default communications" -f 'Room Mics role')
+            Add-Result 'Audio input default' 'default communications device' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "hr $(Format-Hr $hr)"
+
+            $keep = @($inDevice.Id)
+            if ($content.Count) {
+                foreach ($c in $content) {
+                    $keep += $c.Id
+                    if ($c.State -eq 2) { [void][MtrAudio]::SetVisible($c.Id, $true); Start-Sleep -Milliseconds 800 }
+                    $hr = [MtrAudio]::SetVolume($c.Id, [single]1.0)
+                    $now = [math]::Round([MtrAudio]::GetVolume($c.Id) * 100)
+                    Add-Result 'Audio content capture volume' "$now" $(if ($hr -eq 0 -and $now -eq 100) { 'OK' } else { 'FAILED' }) "$($c.FriendlyName) - wanted 100 - hr $(Format-Hr $hr)"
+                }
+                $hr = 0
+                foreach ($role in 0, 1) { $hr = [MtrAudio]::SetDefault($content[0].Id, $role); if ($hr -ne 0) { break } }
+                Write-Host ("  {0,-42} = default device" -f "Capture: $($content[0].FriendlyName)")
+                Add-Result 'Audio content capture default' $content[0].FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "default device - hr $(Format-Hr $hr)"
+
+                $hr = [MtrAudio]::Rename($content[0].Id, 'Content Capture Input')
+                Write-Host ("  {0,-42} = Content Capture Input" -f 'Content capture name')
+                Add-Result 'Audio content capture name' 'Content Capture Input' $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($content[0].Adapter) - hr $(Format-Hr $hr)"
+            } else {
+                Add-Result 'Audio content capture' 'not found' 'SKIP' 'no input matching Tap HDMI Capture, Yealink Capture, mTouch or HDMI Capture'
+            }
+
+            $offIn = @([MtrAudio]::GetEndpoints(1) | Where-Object { $keep -notcontains $_.Id -and ($_.State -eq 1 -or $_.State -eq 8) })
+            foreach ($o in $offIn) {
+                $hr = [MtrAudio]::SetVisible($o.Id, $false)
+                Write-Host ("  {0,-42} = disabled" -f "Input: $($o.FriendlyName)")
+                Add-Result 'Audio input disabled' $o.FriendlyName $(if ($hr -eq 0) { 'OK' } else { 'FAILED' }) "$($o.Adapter) - hr $(Format-Hr $hr)"
+            }
+            if (-not $offIn.Count) { Add-Result 'Audio input disabled' 'none to disable' 'OK' '' }
+        }
+        elseif ($outDevice) {
+            Add-Result 'Audio input' 'no Echo Cancelling Speakerphone input' 'SKIP' 'inputs left as they are'
+        }
+    }
+    catch {
+        Write-Host "  Audio                                      = FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        Add-Result 'Audio' 'configure' 'FAILED' $_.Exception.Message
+    }
+}
+
+
+# ---------------------------------------------------------------------------
+# 11. REPORT
+# ---------------------------------------------------------------------------
+Write-Host "`n[11] Writing report" -ForegroundColor Cyan
 
 $restartReasons = @(Get-PendingRestartReasons)
 
@@ -1690,7 +2149,7 @@ if (-not $ips) { $ips = @('none') }
 $stamp    = Get-Date
 $failed   = @($script:Results | Where-Object Status -eq 'FAILED')
 $skipped  = @($script:Results | Where-Object Status -eq 'SKIP')
-$logName  = "$ReportHost-MTR-Applied-Settings.log"
+$logName  = "${ReportHost}_Applied-Settings.log"
 $logPath  = Join-Path $workDir $logName
 
 $report = New-Object System.Text.StringBuilder
@@ -1757,6 +2216,11 @@ if ($script:TaskbarPinsSet) {
     Add-Line '  Taskbar pins appear when Explorer restarts at the end of this run.'
     Add-Line
 }
+if ($script:DefaultBrowserSet) {
+    Add-Line '  Firefox becomes the default browser at the next sign-in of this account'
+    Add-Line '  (Windows applies the default associations file when a user signs in).'
+    Add-Line
+}
 Add-Line '  WinRM is enabled on this machine, but it is a workgroup machine'
 Add-Line '  (not domain-joined) - connecting from another PC still needs that'
 Add-Line '  PC''s own TrustedHosts set first, e.g. from an elevated prompt there:'
@@ -1781,9 +2245,9 @@ catch {
 
 
 # ---------------------------------------------------------------------------
-# 11. APPLY
+# 12. APPLY
 # ---------------------------------------------------------------------------
-Write-Host "`n[11] Restarting Explorer to apply..." -ForegroundColor Cyan
+Write-Host "`n[12] Restarting Explorer to apply..." -ForegroundColor Cyan
 Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 

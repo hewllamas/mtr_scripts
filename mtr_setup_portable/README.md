@@ -31,13 +31,15 @@ auto-logon account.
 
 ### Prompts at the start
 
-1. **Hostname** - only if the PC still has a Windows default name (`DESKTOP-xxxxxxx`).
-   Type a new name and click Rename; it takes effect after a restart. If nobody types, it
-   keeps the current name after 60 seconds.
-2. **Setup** - untick software you don't want, choose how long before the display turns
-   off (default 20 minutes), then Continue. "Skip installs" installs nothing but still
-   applies the display setting. If nobody touches it, it carries on with what's ticked
-   after 60 seconds.
+1. **Setup** - untick software you don't want and choose how long before the display turns
+   off (default 20 minutes). **Config + Software** installs what is ticked; **Config Only**
+   installs nothing but still applies the display setting; **Cancel** (or closing the
+   window) stops the script before anything is changed. If nobody touches it, it carries on
+   with what's ticked after 60 seconds. Tick **Overwrite Hostname** to be asked for a new
+   hostname even when the PC already has a real name.
+2. **Hostname** - only if the PC still has a Windows default name (`DESKTOP-xxxxxxx`), or
+   if Overwrite Hostname is ticked. Type a new name and click Rename; it takes effect after a
+   restart. If nobody types, it keeps the current name after 60 seconds.
 
 Everything starts ticked except **Splashtop Streamer**, and on **Yealink** MTRs also
 **Extron Control** and **Logitech Sync**. Software already installed at the same or a
@@ -64,21 +66,23 @@ Running the `.ps1` directly from an elevated prompt also accepts:
 
 | Section | Settings |
 |---|---|
-| Hostname | Renames a `DESKTOP-xxxxxxx` name (NetBIOS rules checked) |
+| Hostname | Renames a `DESKTOP-xxxxxxx` name, or any name if Overwrite Hostname is ticked (NetBIOS rules checked) |
 | Start menu | Turns off recent files, recommendations, most-used apps, recently added apps, tips and account notifications; hides the Recommended section; empties the Pinned grid (swaps in `assets/start2.bin`); shows Settings and Downloads beside the power button |
 | File Explorer | Shows file extensions |
 | Power | Never sleeps or hibernates; display off after N minutes; USB selective suspend, hybrid sleep and PCIe link-state power management off; USB power saving off per device; Modern Standby disabled; wake enabled for the HID presence sensor and touch screen when present |
-| Shortcuts and folders | Creates `Downloads\_mtrsetup`, copies `MTR-MMC-Local.msc` there and adds a Desktop shortcut |
+| Shortcuts and folders | Creates `Downloads\_mtrsetup` with a Desktop shortcut to it, copies `MTR-MMC-Local.msc` there and adds a Desktop shortcut for it |
 | Software installs | See below |
+| Default browser | Makes Firefox the default for http, https, .htm and .html through a default associations file named by policy; applies at the next sign-in |
 | Taskbar | Hides search and Task view, removes Widgets, shows all tray icons, left-aligned, no badges or flashing, one taskbar, always combine, auto-hide off; clears every default pin and pins File Explorer, the MTR console, Settings, Firefox, Yealink Room Connect (Yealink only) and Logitech Sync (the last three only if installed) |
 | Appearance | Wallpaper (Fill), dark mode, automatic accent colour |
 | Remote management | Sets Public network interfaces to Private, enables PS Remoting and WinRM, allows ping; turns TightVNC "hide desktop wallpaper" and "serve Java viewer" off |
+| Audio | Makes the Echo Cancelling Speakerphone (or a QSYS DSP shown as `DSP`) the only output - renamed Room Audio Output, volume 60, default - and its input Room Mics (volume 100, default communications); the content capture input is renamed Content Capture Input (volume 100, default); every other active or unplugged audio device is disabled. Nothing is changed if no speakerphone is found |
 | Cleanup | Removes the Xbox, WhatsApp, Solitaire and LinkedIn Store apps (deprovisioned first, so new profiles do not get them) and TeamViewer if present |
 
 Taskbar pins are set with a layout file (`C:\ProgramData\MTR-Setup\TaskbarLayout.xml`) and
 the per-user Start Layout policy, and appear when Explorer restarts at the end of the run. Before that restart the saved pins under Taskband are cleared, because Explorer otherwise ignores the layout file once it has pins of its own.
 
-The Pinned grid is emptied by copying ssets/start2.bin (a start2.bin captured from an MTR with everything unpinned) into the Start menu's LocalState folder. Without that file the step is skipped.
+The Pinned grid is emptied by copying `assets/start2.bin` (a `start2.bin` captured from an MTR with everything unpinned) into the Start menu's LocalState folder. Without that file the step is skipped.
 
 ### Software
 
@@ -97,7 +101,7 @@ in its filename - don't rename it.
 
 ## Reports
 
-Each run writes `<hostname>-MTR-Applied-Settings.log` to `logs/` on the stick and to
+Each run writes `<hostname>_Applied-Settings.log` to `logs/` on the stick and to
 `Downloads\_mtrsetup` on the MTR: machine details, every setting with OK / SKIP / FAILED,
 and notes. The script version is `$ScriptVersion` in `mtr-windows-settings.ps1`.
 

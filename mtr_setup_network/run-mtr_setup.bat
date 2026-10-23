@@ -15,6 +15,10 @@ title MTR Windows standardisation (network)
 ::  Ignore the "CMD does not support UNC paths as current directories"
 ::  warning - the script uses absolute paths and works regardless.
 ::
+::  Optional: add -noprompt (run-mtr_setup.bat -noprompt) to skip the software tick-box
+::  window and install the default selection (Splashtop Streamer, and on Yealink
+::  MTRs Extron Control and Logitech Sync, are left out).
+::
 ::  Optional: add -debug (run-mtr_setup.bat -debug) to turn on extra [diag]
 ::  console lines in the .ps1 (e.g. the MSI ProductCode lookup). Off by
 ::  default - these are noisy and only meant for chasing a specific bug.
@@ -25,9 +29,12 @@ set "CFG=network-settings.psd1"
 set "STAGE=C:\Scripts"
 set "SELF=%~nx0"
 set "DEBUGARG="
+set "NOPROMPTARG="
 
-if /i "%~1"=="-debug" set "DEBUGARG=-debug"
-if /i "%~2"=="-debug" set "DEBUGARG=-debug"
+for %%A in (%*) do (
+    if /i "%%~A"=="-debug"    set "DEBUGARG=-debug"
+    if /i "%%~A"=="-noprompt" set "NOPROMPTARG=-noprompt"
+)
 
 if /i "%~1"=="/elevated" goto :run
 
@@ -76,30 +83,30 @@ copy /y "%~f0" "%STAGE%\%SELF%" >nul
 :: --- elevate, then re-launch the local copy ---------------------------------
 net session >nul 2>&1
 if %errorlevel% equ 0 (
-    call "%STAGE%\%SELF%" /elevated %DEBUGARG%
+    call "%STAGE%\%SELF%" /elevated %DEBUGARG% %NOPROMPTARG%
     exit /b
 )
 
 echo Requesting administrator rights...
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%STAGE%\%SELF%' -ArgumentList '/elevated %DEBUGARG%' -WorkingDirectory '%STAGE%' -Verb RunAs"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%STAGE%\%SELF%' -ArgumentList '/elevated %DEBUGARG% %NOPROMPTARG%' -WorkingDirectory '%STAGE%' -Verb RunAs"
 exit /b
 
 
 :: --- elevated pass ----------------------------------------------------------
 :run
 cd /d "%STAGE%"
-if /i "%DEBUGARG%"=="-debug" (
-    echo [DEBUG MODE ENABLED]
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%STAGE%\%PS1%" -Debug
-) else (
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%STAGE%\%PS1%"
-)
+set "PSFLAGS="
+if defined DEBUGARG set "PSFLAGS=%PSFLAGS% -Debug"
+if defined NOPROMPTARG set "PSFLAGS=%PSFLAGS% -NoPrompt"
+if defined DEBUGARG echo [DEBUG MODE ENABLED]
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%STAGE%\%PS1%"%PSFLAGS%
 set "PSEXIT=%errorlevel%"
 
-:: The script exits 2 when the share details are missing - nothing was applied.
+:: The script exits 2 before changing anything: the share details are missing
+:: (fill in %CFG%), or Cancel was pressed in the setup prompt. No log-off, no restart.
 if "%PSEXIT%"=="2" (
     echo.
-    echo Not configured - fill in %CFG% and run it again.
+    echo Stopped - nothing was changed. If the share details are missing, fill in %CFG% and run it again.
     pause
     exit /b 2
 )
@@ -109,7 +116,15 @@ echo ---------------------------------------------------------------------
 echo Finished on %COMPUTERNAME% as %USERNAME%.
 echo Explorer has been restarted - check Start and Taskbar look right.
 echo.
-echo Logging off in 120 seconds...
-timeout /t 120
-shutdown /l /f
+:: The script exits 3010 (Windows' "restart required") when a restart is
+:: pending - e.g. a hostname change - so restart rather than log off.
+if "%PSEXIT%"=="3010" (
+    echo A restart is pending - restarting in 120 seconds instead of logging off...
+    timeout /t 120
+    shutdown /r /f /t 0
+) else (
+    echo Logging off in 120 seconds...
+    timeout /t 120
+    shutdown /l /f
+)
 exit /b
